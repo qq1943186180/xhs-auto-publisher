@@ -1,0 +1,30 @@
+# XHS Auto Publisher Dependencies
+
+# GUI
+PyQt5>=5.15.0
+PyQt-Fluent-Widgets>=1.5.0
+
+# AI
+openai>=1.10.0
+
+# Database
+SQLAlchemy>=2.0.0
+
+# Network
+requests>=2.31.0
+httpx>=0.25.0
+aiohttp>=3.9.0
+
+# Browser automation
+playwright>=1.40.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Packaging
+pyinstaller>=6.0.0
+
+# Dev tools
+pytest>=7.0.0
+black>=23.0.0
+ruff>=0.1.0
