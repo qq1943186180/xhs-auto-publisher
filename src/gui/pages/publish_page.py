@@ -2,10 +2,13 @@
 Publish Page - 发布管理
 显示所有已生成的笔记，支持发布、删除
 """
+import logging
 import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -44,6 +47,9 @@ from src.gui.styles.theme import (
     page_title_style,
     placeholder_style,
 )
+from src.gui.utils import PAGE_MARGINS, status_label
+from src.gui.widgets.status_badge import StatusBadge
+from src.gui.workers.image_loader import AsyncImageLoader, _create_placeholder_pixmap
 
 
 class PublishPage(QWidget):
@@ -53,13 +59,15 @@ class PublishPage(QWidget):
     direct_image_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
-        self._items = []
         super().__init__(parent)
+        self._items = []
+        self._image_loader = AsyncImageLoader(self)
+        self._image_loader.image_loaded.connect(self._on_batch_image_loaded)
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 36)
+        layout.setContentsMargins(PAGE_MARGINS)
         layout.setSpacing(16)
 
         header = QVBoxLayout()
@@ -132,68 +140,152 @@ class PublishPage(QWidget):
         self.table.verticalHeader().hide()
         layout.addWidget(self.table)
 
+    def _build_item_from_note(self, n: dict) -> dict:
+        """统一构建 item 数据，消除重复代码"""
+        raw_status = n.get("status", "draft")
+        display_status = status_label(raw_status)
+        return {
+            "id": n.get("id"),
+            "title": n.get("title", ""),
+            "content": n.get("content", ""),
+            "tags": n.get("tags", ""),
+            "images": n.get("images", []),
+            "image_count": f"{len(n.get('images', []))}张",
+            "status": display_status,
+            "raw_status": raw_status,
+            "product_name": n.get("product_name", ""),
+            "created_at": n.get("created_at", ""),
+            "published_at": n.get("published_at", ""),
+            "error": n.get("error", ""),
+            "variants": n.get("variants", []),
+            "selected_variant_index": n.get("selected_variant_index", 0),
+        }
+
     def load_items(self, items: list):
-        """Load items into table"""
+        """Load items into table with diff logic: only update changed rows"""
+        old_items = self._items
         self._items = items
-        self.table.setRowCount(len(items))
         self.count_label.setText(f"共 {len(items)} 篇笔记")
         self.delete_all_btn.setEnabled(bool(items))
 
-        status_colors = {
-            "草稿": TEXT_MUTED,
-            "待发布": WARNING,
-            "已发布": SUCCESS,
-            "发布失败": ERROR,
-        }
+        # Check if structure changed (different count or different IDs)
+        old_ids = [item.get("id") for item in old_items]
+        new_ids = [item.get("id") for item in items]
+        structure_changed = (
+            len(old_ids) != len(new_ids)
+            or old_ids != new_ids
+        )
 
+        if structure_changed:
+            # Full rebuild
+            self._rebuild_table(items)
+        else:
+            # Diff update: only update changed rows
+            for row, item in enumerate(items):
+                old_item = old_items[row] if row < len(old_items) else {}
+                # Check if item content changed
+                if (
+                    old_item.get("title") != item.get("title")
+                    or old_item.get("status") != item.get("status")
+                    or old_item.get("image_count") != item.get("image_count")
+                    or old_item.get("product_name") != item.get("product_name")
+                ):
+                    self._update_table_row(row, item)
+
+    def _rebuild_table(self, items: list):
+        """Full table rebuild"""
+        self.table.setRowCount(len(items))
         for row, item in enumerate(items):
-            # Checkbox
-            cb = CheckBox()
-            self.table.setCellWidget(row, 0, cb)
+            self._populate_table_row(row, item)
+        # Load images in background
+        self._load_table_images(items)
 
-            # Product name
-            product_name = item.get("product_name", "")
-            self.table.setItem(row, 1, QTableWidgetItem(product_name[:15]))
+    def _populate_table_row(self, row: int, item: dict):
+        """填充单行表格数据"""
+        # Checkbox
+        cb = CheckBox()
+        self.table.setCellWidget(row, 0, cb)
 
-            # Title
-            self.table.setItem(row, 2, QTableWidgetItem(item.get("title", "")[:30]))
+        # Product name
+        product_name = item.get("product_name", "")
+        self.table.setItem(row, 1, QTableWidgetItem(product_name[:15]))
 
-            # Image count / local preview entry
-            image_btn = PushButton(self._image_button_text(item))
-            image_btn.setFixedSize(92, 30)
-            image_btn.setToolTip("查看本地图片和历史路径")
-            image_btn.clicked.connect(lambda _, r=row: self._on_images_clicked(r))
-            self.table.setCellWidget(row, 3, image_btn)
+        # Title
+        self.table.setItem(row, 2, QTableWidgetItem(item.get("title", "")[:30]))
 
-            # Status with color
-            status = item.get("status", "草稿")
-            status_item = QTableWidgetItem(status)
-            status_item.setForeground(QColor(status_colors.get(status, TEXT_MUTED)))
-            self.table.setItem(row, 4, status_item)
+        # Image count / local preview entry
+        image_btn = PushButton(self._image_button_text(item))
+        image_btn.setFixedSize(92, 30)
+        image_btn.setToolTip("查看本地图片和历史路径")
+        image_btn.clicked.connect(lambda _, r=row: self._on_images_clicked(r))
+        self.table.setCellWidget(row, 3, image_btn)
 
-            # Actions
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(4, 4, 4, 4)
-            action_layout.setSpacing(6)
+        # Status with StatusBadge
+        status = item.get("status", "草稿")
+        raw_status = item.get("raw_status", "draft")
+        badge = StatusBadge(raw_status)
+        badge.setFixedHeight(28)
+        self.table.setCellWidget(row, 4, badge)
 
-            view_btn = PushButton("查看")
-            view_btn.setFixedSize(50, 28)
-            view_btn.clicked.connect(lambda _, r=row: self._on_view_detail(r))
-            action_layout.addWidget(view_btn)
+        # Actions
+        self._populate_action_widget(row, item)
 
-            if status in ("草稿", "待发布", "发布失败"):
-                pub_btn = PushButton("发布")
-                pub_btn.setFixedSize(50, 28)
-                pub_btn.clicked.connect(lambda _, r=row: self._on_publish_single(r))
-                action_layout.addWidget(pub_btn)
+    def _update_table_row(self, row: int, item: dict):
+        """更新单行表格数据（不重建）"""
+        if row >= self.table.rowCount():
+            return
 
-            del_btn = PushButton("删除")
-            del_btn.setFixedSize(50, 28)
-            del_btn.clicked.connect(lambda _, r=row: self._on_delete(r))
-            action_layout.addWidget(del_btn)
+        # Update product name
+        product_name = item.get("product_name", "")
+        title_item = self.table.item(row, 1)
+        if title_item:
+            title_item.setText(product_name[:15])
 
-            self.table.setCellWidget(row, 5, action_widget)
+        # Update title
+        title_item = self.table.item(row, 2)
+        if title_item:
+            title_item.setText(item.get("title", "")[:30])
+
+        # Update image count button
+        image_btn = self.table.cellWidget(row, 3)
+        if isinstance(image_btn, PushButton):
+            image_btn.setText(self._image_button_text(item))
+
+        # Update status badge
+        raw_status = item.get("raw_status", "draft")
+        badge = self.table.cellWidget(row, 4)
+        if isinstance(badge, StatusBadge):
+            badge.set_status(raw_status)
+
+    def _populate_action_widget(self, row: int, item: dict):
+        """填充操作列"""
+        action_widget = QWidget()
+        action_layout = QHBoxLayout(action_widget)
+        action_layout.setContentsMargins(4, 4, 4, 4)
+        action_layout.setSpacing(6)
+
+        view_btn = PushButton("查看")
+        view_btn.setFixedSize(50, 28)
+        view_btn.clicked.connect(lambda _, r=row: self._on_view_detail(r))
+        action_layout.addWidget(view_btn)
+
+        status = item.get("status", "草稿")
+        if status in ("草稿", "待发布", "发布失败"):
+            pub_btn = PushButton("发布")
+            pub_btn.setFixedSize(50, 28)
+            pub_btn.clicked.connect(lambda _, r=row: self._on_publish_single(r))
+            action_layout.addWidget(pub_btn)
+
+        del_btn = PushButton("删除")
+        del_btn.setFixedSize(50, 28)
+        del_btn.clicked.connect(lambda _, r=row: self._on_delete(r))
+        action_layout.addWidget(del_btn)
+
+        self.table.setCellWidget(row, 5, action_widget)
+
+    def _on_batch_image_loaded(self, index: int, path: str, pixmap):
+        """批量图片加载完成回调（暂不处理，表格图片通过按钮文字显示）"""
+        pass
 
     def _note_images(self, item: dict) -> list:
         images = item.get("images") or []
@@ -217,8 +309,12 @@ class PublishPage(QWidget):
 
         note_id = item.get("id")
         if note_id:
-            from src.database.generated_store import update_note_images
-            update_note_images(note_id, clean_images)
+            try:
+                from src.database.generated_store import update_note_images
+                update_note_images(note_id, clean_images)
+            except Exception as e:
+                InfoBar.error("保存图片失败", str(e), parent=self)
+                return
 
         for existing_item in self._items:
             if existing_item.get("id") == note_id:
@@ -504,7 +600,7 @@ class PublishPage(QWidget):
 
         images = self._existing_images(item)
         if not images:
-            empty = QLabel("这条历史记录还没有可打开的本地图片。可以先复制 AI 提示词去生图，生成后用“本地上传图片”加回来。")
+            empty = QLabel('这条历史记录还没有可打开的本地图片。可以先复制 AI 提示词去生图，生成后用"本地上传图片"加回来。')
             empty.setWordWrap(True)
             empty.setStyleSheet(placeholder_style() + "QLabel { padding: 14px; }")
             layout.addWidget(empty)
@@ -626,13 +722,15 @@ class PublishPage(QWidget):
 
         image_label = QLabel()
         image_label.setAlignment(Qt.AlignCenter)
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            image_label.setText("无法读取")
-        else:
-            max_w = 165 if compact else 240
-            max_h = 120 if compact else 185
-            image_label.setPixmap(pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # 使用异步加载
+        placeholder = _create_placeholder_pixmap(165 if compact else 240, 120 if compact else 185, "加载中...")
+        image_label.setPixmap(placeholder)
+        self._image_loader.load_single(
+            hash(path) % 10000,  # 用 hash 作为临时索引
+            path,
+            165 if compact else 240,
+            120 if compact else 185,
+        )
         layout.addWidget(image_label, stretch=1)
 
         name_label = QLabel(Path(path).name)
@@ -705,34 +803,16 @@ class PublishPage(QWidget):
         else:
             self.progress_bar.setValue(0)
 
+    def _load_table_images(self, items: list):
+        """后台加载表格中的图片"""
+        pass  # 图片通过按钮文字显示，不需要实际加载
+
     def _on_refresh(self):
         """Reload from store"""
         try:
             from src.database.generated_store import get_all_notes
             notes = get_all_notes()
-            items = []
-            for n in notes:
-                status_text = {
-                    "draft": "草稿",
-                    "pending": "待发布",
-                    "published": "已发布",
-                    "failed": "发布失败",
-                }.get(n.get("status", "draft"), n.get("status", ""))
-                items.append({
-                    "id": n.get("id"),
-                    "title": n.get("title", ""),
-                    "content": n.get("content", ""),
-                    "tags": n.get("tags", ""),
-                    "images": n.get("images", []),
-                    "image_count": f"{len(n.get('images', []))}张",
-                    "status": status_text,
-                    "product_name": n.get("product_name", ""),
-                    "created_at": n.get("created_at", ""),
-                    "published_at": n.get("published_at", ""),
-                    "error": n.get("error", ""),
-                    "variants": n.get("variants", []),
-                    "selected_variant_index": n.get("selected_variant_index", 0),
-                })
+            items = [self._build_item_from_note(n) for n in notes]
             self.load_items(items)
             InfoBar.success("刷新成功", f"共 {len(items)} 篇笔记", parent=self)
         except Exception as e:
@@ -751,12 +831,21 @@ class PublishPage(QWidget):
             InfoBar.warning("提示", "请先勾选要发布的笔记", parent=self)
 
     def _on_publish_all(self):
-        """Publish all pending items"""
+        """Publish all pending items with confirmation"""
         pending = [item for item in self._items if item.get("status") in ("草稿", "待发布", "发布失败")]
-        if pending:
-            self.publish_requested.emit(pending)
-        else:
+        if not pending:
             InfoBar.warning("提示", "没有待发布的笔记", parent=self)
+            return
+
+        result = QMessageBox.question(
+            self,
+            "确认全部发布",
+            f"确定发布全部 {len(pending)} 篇笔记吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result == QMessageBox.Yes:
+            self.publish_requested.emit(pending)
 
     def _on_publish_single(self, row):
         if 0 <= row < len(self._items):
@@ -770,8 +859,14 @@ class PublishPage(QWidget):
                 try:
                     from src.database.generated_store import delete_note
                     delete_note(note_id)
-                except:
-                    pass
+                except FileNotFoundError as e:
+                    logger.warning("Note file not found: %s", e)
+                except PermissionError as e:
+                    InfoBar.error("删除失败", f"权限不足: {e}", parent=self)
+                    return
+                except Exception as e:
+                    InfoBar.error("删除失败", str(e), parent=self)
+                    return
             self._items.pop(row)
             self.load_items(self._items)
 

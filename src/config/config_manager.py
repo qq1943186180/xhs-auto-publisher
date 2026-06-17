@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/128.0.0.0 Safari/537.36"
         ),
         "proxy": "",
         "timeout": 30,
@@ -65,8 +65,22 @@ ENV_OVERRIDES = {
 }
 
 
+# ----------------------------------------------------------
+# 配置文件字段混淆
+# ----------------------------------------------------------
+# WARNING: _simple_encrypt / _simple_decrypt 仅做轻量混淆，
+# **不是**真正的加密。攻击者读取源码即可还原。
+# 敏感字段（cookie 等）在传输/存储中应使用 Fernet 加密方案，
+# 此处仅防止明文泄露到磁盘。
+# ----------------------------------------------------------
+
+
 def _simple_encrypt(text: str) -> str:
-    """Small obfuscation for locally stored sensitive fields."""
+    """Lightweight obfuscation for locally stored sensitive fields.
+
+    NOT secure encryption — only prevents casual plaintext on disk.
+    For real encryption, use cryptography.fernet.
+    """
     if not text:
         return ""
     shifted = "".join(chr((ord(c) + 3) % 65536) for c in text)
@@ -74,6 +88,7 @@ def _simple_encrypt(text: str) -> str:
 
 
 def _simple_decrypt(encoded: str) -> str:
+    """Reverse of _simple_encrypt (obfuscation only)."""
     if not encoded:
         return ""
     try:
@@ -180,6 +195,17 @@ class ConfigManager:
             if env_name in os.environ:
                 self.set(key_path, self._cast_value(os.environ[env_name]), save=False)
 
+        # 映射 OPENAI_API_KEY / KIMI_API_KEY 等通用环境变量
+        # 这些不存入 config.json，仅供 API Key Manager 等模块读取
+        env_api_key_map = {
+            "OPENAI_API_KEY": "xhs.openai_api_key",
+            "KIMI_API_KEY": "xhs.kimi_api_key",
+            "QWEN_API_KEY": "xhs.qwen_api_key",
+        }
+        for env_name, key_path in env_api_key_map.items():
+            if env_name in os.environ and not self.get(key_path):
+                self.set(key_path, os.environ[env_name], save=False)
+
     @staticmethod
     def _cast_value(value: str) -> Any:
         if value.lower() in ("true", "yes", "1"):
@@ -189,11 +215,11 @@ class ConfigManager:
         try:
             return int(value)
         except ValueError:
-            pass
+            logger.debug("Caught ValueError, continuing")
         try:
             return float(value)
         except ValueError:
-            pass
+            logger.debug("Caught ValueError, continuing")
         return value
 
 

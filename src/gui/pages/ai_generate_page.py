@@ -4,6 +4,7 @@ AI Generate Page - 两轮生成：方向 → 文案（3方向 × 3篇 = 9篇）
 import os
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QLabel, QSizePolicy,
+    QScrollArea, QFrame,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap
@@ -25,6 +26,8 @@ from src.gui.styles.theme import (
     page_title_style,
     placeholder_style,
 )
+from src.gui.utils import PAGE_MARGINS
+from src.gui.workers.image_loader import AsyncImageLoader, _create_placeholder_pixmap
 
 
 class AIGeneratePage(QWidget):
@@ -38,6 +41,7 @@ class AIGeneratePage(QWidget):
     IMAGE_STYLE_LABELS = ["博主风", "纯白简约", "氛围场景"]
 
     def __init__(self, parent=None):
+        super().__init__(parent)
         self._product = None
         self._is_generating = False
         self._is_retrying_images = False
@@ -48,12 +52,13 @@ class AIGeneratePage(QWidget):
         self._posts = []           # 全部 9 篇
         self._directions = []      # 3 个方向
         self._current_post_idx = 0
-        super().__init__(parent)
+        self._image_loader = AsyncImageLoader(self)
+        self._image_loader.image_loaded.connect(self._on_image_loaded)
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 36)
+        layout.setContentsMargins(PAGE_MARGINS)
         layout.setSpacing(16)
 
         # ===== Header: 标题 + 方向/帖子导航 =====
@@ -116,7 +121,7 @@ class AIGeneratePage(QWidget):
         content_layout = QHBoxLayout()
         content_layout.setSpacing(16)
 
-        # ===== Left: 3 image previews =====
+        # ===== Left: 3 image previews + post index panel =====
         left_card = CardWidget(self)
         left_layout = QVBoxLayout(left_card)
         left_layout.setContentsMargins(16, 16, 16, 16)
@@ -172,6 +177,19 @@ class AIGeneratePage(QWidget):
         di_layout.addWidget(self.dir_hook_label)
         self.direction_info_card.hide()
         left_layout.addWidget(self.direction_info_card)
+
+        # 帖子索引面板（3×3 网格小卡片）
+        left_layout.addSpacing(8)
+        self.post_index_panel = QScrollArea()
+        self.post_index_panel.setWidgetResizable(True)
+        self.post_index_panel.setMaximumHeight(220)
+        self.post_index_panel.setFrameShape(QScrollArea.NoFrame)
+        self._post_index_container = QWidget()
+        self._post_index_grid = QGridLayout(self._post_index_container)
+        self._post_index_grid.setContentsMargins(0, 0, 0, 0)
+        self._post_index_grid.setSpacing(6)
+        self.post_index_panel.setWidget(self._post_index_container)
+        left_layout.addWidget(self.post_index_panel)
 
         left_layout.addStretch()
         content_layout.addWidget(left_card, stretch=1)
@@ -241,13 +259,13 @@ class AIGeneratePage(QWidget):
         self.publish_btn.clicked.connect(self._on_publish)
         action_grid.addWidget(self.publish_btn, 1, 0)
 
-        self.publish_all_btn = PushButton("9版用于挑选")
-        self.publish_all_btn.setFixedHeight(44)
-        self.publish_all_btn.setMinimumWidth(140)
-        self.publish_all_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.publish_all_btn.setEnabled(False)
-        self.publish_all_btn.setToolTip("9 个版本只是备选，发布管理只保留当前选中的 1 篇")
-        action_grid.addWidget(self.publish_all_btn, 1, 1)
+        # 提示文字替代原来永远禁用的按钮
+        self.publish_hint_label = QLabel("9版用于挑选")
+        self.publish_hint_label.setFixedHeight(44)
+        self.publish_hint_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
+        self.publish_hint_label.setAlignment(Qt.AlignCenter)
+        action_grid.addWidget(self.publish_hint_label, 1, 1)
+
         action_grid.setColumnStretch(0, 3)
         action_grid.setColumnStretch(1, 2)
         right_layout.addLayout(action_grid)
@@ -289,20 +307,19 @@ class AIGeneratePage(QWidget):
 
         status = slot.get("status", "pending")
         path = slot.get("path", "")
-        if status == "image":
-            if path and os.path.exists(path):
-                pixmap = QPixmap(path)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(200, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    label.setPixmap(scaled)
-                    label.setToolTip(path)
-                    label.setStyleSheet(
-                        f"background: {SURFACE_ALT}; border: 1px solid {BORDER}; "
-                        f"border-radius: 8px; font-size: 13px; color: {TEXT_MUTED};"
-                    )
-                    return
-            slot["status"] = "failed"
-            slot["error"] = "图片文件不存在"
+
+        if status == "image" and path:
+            # 使用异步加载器
+            placeholder = _create_placeholder_pixmap(200, 260, "加载中...")
+            label.setPixmap(placeholder)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(
+                f"background: {SURFACE_ALT}; border: 1px solid {BORDER}; "
+                f"border-radius: 8px; font-size: 13px; color: {TEXT_MUTED};"
+            )
+            label.setToolTip(path)
+            self._image_loader.load_single(index, path, 200, 260)
+            return
 
         if slot.get("status") == "failed":
             label.setText("生成失败\n点击重试")
@@ -315,6 +332,11 @@ class AIGeneratePage(QWidget):
             label.setText("等待生成...")
             label.setToolTip("")
             label.setStyleSheet(placeholder_style())
+
+    def _on_image_loaded(self, index: int, path: str, pixmap):
+        """异步图片加载完成回调"""
+        if 0 <= index < len(self.img_previews):
+            self.img_previews[index].setPixmap(pixmap)
 
     def _update_generated_images_from_slots(self):
         self._generated_images = [
@@ -344,11 +366,7 @@ class AIGeneratePage(QWidget):
     def _show_product_reference(self):
         local_imgs = self._product.get("local_images", []) if self._product else []
         if local_imgs and os.path.exists(local_imgs[0]):
-            pixmap = QPixmap(local_imgs[0])
-            if not pixmap.isNull():
-                scaled = pixmap.scaled(200, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.img_previews[0].setPixmap(scaled)
-                self.img_previews[0].setToolTip("产品原图（生成前参考）")
+            self._image_loader.load_single(0, local_imgs[0], 200, 260)
 
     def set_product(self, product: dict):
         self._product = product
@@ -374,6 +392,10 @@ class AIGeneratePage(QWidget):
 
         self._render_all_image_slots()
         self._show_product_reference()
+
+    def get_product(self) -> dict | None:
+        """获取当前产品数据（替代直接访问 _product）"""
+        return self._product
 
     def set_images(self, image_paths: list):
         """Display 3 generated images"""
@@ -538,6 +560,9 @@ class AIGeneratePage(QWidget):
             self.direction_combo.addItem(label)
         self.direction_combo.blockSignals(False)
 
+        # 构建帖子索引面板
+        self._build_post_index_panel()
+
         # 显示第一篇
         if posts:
             self._show_post(0)
@@ -545,11 +570,59 @@ class AIGeneratePage(QWidget):
         else:
             self.total_label.setText("")
 
+    def _build_post_index_panel(self):
+        """构建 3×3 帖子索引面板"""
+        # 清空现有内容
+        while self._post_index_grid.count():
+            item = self._post_index_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for i, post in enumerate(self._posts):
+            row = i // 3
+            col = i % 3
+
+            card = QFrame()
+            card.setFixedSize(80, 60)
+            card.setCursor(Qt.PointingHandCursor)
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background: {SURFACE_ALT};
+                    border: 1px solid {BORDER};
+                    border-radius: 6px;
+                }}
+                QFrame:hover {{
+                    border-color: {PRIMARY};
+                    background: {TEXT_SECONDARY}10;
+                }}
+            """)
+
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(4, 4, 4, 4)
+            card_layout.setSpacing(2)
+
+            idx_label = QLabel(f"#{i + 1}")
+            idx_label.setAlignment(Qt.AlignCenter)
+            idx_label.setStyleSheet(f"font-size: 12px; font-weight: bold; color: {TEXT_PRIMARY};")
+            card_layout.addWidget(idx_label)
+
+            dir_id = post.get("direction_id", "?")
+            dir_label = QLabel(f"D{dir_id}")
+            dir_label.setAlignment(Qt.AlignCenter)
+            dir_label.setStyleSheet(f"font-size: 10px; color: {TEXT_MUTED};")
+            card_layout.addWidget(dir_label)
+
+            # 点击事件
+            card.mousePressEvent = lambda event, idx=i: self._show_post(idx)
+
+            self._post_index_grid.addWidget(card, row, col)
+
+        self.post_index_panel.setVisible(bool(self._posts))
+
     def set_generating(self, generating: bool):
         self._is_generating = generating
         self.generate_btn.setEnabled(not generating)
         self.publish_btn.setEnabled(not generating)
-        self.publish_all_btn.setEnabled(not generating)
         if generating:
             self.progress_bar.show()
             self.progress_bar.setRange(0, 0)
@@ -597,12 +670,51 @@ class AIGeneratePage(QWidget):
         # 更新导航按钮状态
         self.prev_btn.setEnabled(idx > 0)
         self.next_btn.setEnabled(idx < len(self._posts) - 1)
-        self.post_nav_label.setText(f"{idx + 1}/{len(self._posts)}")
 
         # 高亮当前方向的所有帖子
         dir_posts = [i for i, p in enumerate(self._posts) if p.get("direction_id") == dir_id]
         local_idx = dir_posts.index(idx) + 1 if idx in dir_posts else 0
         self.post_nav_label.setText(f"方向{dir_id} 第{local_idx}/{len(dir_posts)}篇 | 总 {idx + 1}/{len(self._posts)}")
+
+        # 更新索引面板高亮
+        self._update_post_index_highlight(idx)
+
+    def _update_post_index_highlight(self, active_idx: int):
+        """更新帖子索引面板的高亮状态"""
+        for i in range(self._post_index_grid.count()):
+            item = self._post_index_grid.itemAt(i)
+            if item and item.widget():
+                card = item.widget()
+                if i == active_idx:
+                    card.setStyleSheet(f"""
+                        QFrame {{
+                            background: {PRIMARY};
+                            border: 1px solid {PRIMARY};
+                            border-radius: 6px;
+                        }}
+                        QFrame QLabel {{
+                            color: #ffffff;
+                        }}
+                    """)
+                    # 更新子标签颜色
+                    for j in range(card.layout().count()):
+                        child = card.layout().itemAt(j)
+                        if child and child.widget():
+                            child.widget().setStyleSheet(
+                                child.widget().styleSheet().replace(TEXT_PRIMARY, "#ffffff").replace(TEXT_MUTED, "#ffffffcc")
+                            )
+                else:
+                    card.setStyleSheet(f"""
+                        QFrame {{
+                            background: {SURFACE_ALT};
+                            border: 1px solid {BORDER};
+                            border-radius: 6px;
+                        }}
+                        QFrame:hover {{
+                            border-color: {PRIMARY};
+                            background: {TEXT_SECONDARY}10;
+                        }}
+                    """)
 
     def _update_direction_info(self, dir_id: str):
         """更新方向信息卡片"""

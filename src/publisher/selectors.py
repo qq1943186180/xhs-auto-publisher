@@ -1,6 +1,7 @@
 """
 小红书页面选择器配置
 每个关键元素提供 8-12 个备选选择器，用于 fallback
+选择器可靠性标注：高 = 直接语义匹配，中 = class 匹配，低 = 泛化匹配
 """
 
 # ============================================================
@@ -8,17 +9,15 @@
 # ============================================================
 
 # 登录状态检测 - 已登录的标志元素
+# 可靠性: 高（收紧为创作者中心专属元素，避免泛化匹配）
 LOGIN_INDICATORS = [
-    'div.user-info',
-    'img.user-avatar',
-    'span.user-name',
-    'div.side-bar .user',
-    '.login-container .avatar',
-    '[class*="user-info"]',
-    '[class*="avatar"]',
-    '.reds-avatar',
-    'a[href*="user/profile"]',
-    '.header-user',
+    'div.user-info',                                      # 高 - 创作者中心侧边栏用户区
+    'img.user-avatar',                                    # 高 - 用户头像
+    'span.user-name',                                     # 高 - 用户昵称
+    'div.side-bar .user',                                 # 高 - 侧边栏用户模块
+    '.creator-header .user-info',                         # 高 - 创作者中心 header 用户区
+    '.creator-header img[class*="avatar"]',               # 高 - 创作者中心 header 头像
+    '.side-bar .user .name',                              # 高 - 侧边栏用户名
 ]
 
 # 未登录/需要登录的标志
@@ -154,19 +153,20 @@ TITLE_INPUT = [
 ]
 
 # 正文输入框（通常是 contenteditable div）
+# 可靠性: 中（添加层级限定，避免匹配到非编辑区域的 contenteditable）
 CONTENT_INPUT = [
-    'div[contenteditable="true"][class*="content"]',
-    'div[contenteditable="true"][class*="post"]',
-    'div[contenteditable="true"][class*="editor"]',
-    'div[contenteditable="true"][class*="note"]',
-    '#post-textarea',
-    'div[contenteditable="true"][class*="ql-editor"]',
-    'div[class*="editor"] div[contenteditable]',
-    'div[contenteditable="true"]',
-    'textarea[placeholder*="正文"]',
-    'textarea[class*="content"]',
-    'div[class*="ql-editor"]',
-    'div[class*="ProseMirror"]',
+    'div[contenteditable="true"][class*="content"]',       # 中 - 直接 class 限定
+    'div[contenteditable="true"][class*="post"]',          # 中
+    'div[contenteditable="true"][class*="editor"]',        # 中
+    'div[contenteditable="true"][class*="note"]',          # 中
+    '#post-textarea',                                       # 高 - ID 直接匹配
+    'div[contenteditable="true"][class*="ql-editor"]',     # 高 - Quill 编辑器
+    'div[class*="editor"] div[contenteditable="true"]',    # 中 - 父级限定
+    'div[class*="note-editor"] div[contenteditable="true"]',  # 中 - 父级限定
+    'textarea[placeholder*="正文"]',                        # 高 - textarea 直接匹配
+    'textarea[class*="content"]',                           # 中
+    'div[class*="ql-editor"]',                              # 高 - Quill
+    'div[class*="ProseMirror"]',                            # 高 - ProseMirror
 ]
 
 # ============================================================
@@ -235,13 +235,16 @@ PUBLISH_BUTTON = [
 ]
 
 # 发布成功标志
+# 可靠性: 高（增加了 URL 跳转检测的注释提示）
 PUBLISH_SUCCESS_INDICATOR = [
-    'div[class*="success"]',
-    'div:has-text("发布成功")',
-    'span:has-text("发布成功")',
-    'div[class*="publish-success"]',
-    '.toast-success',
-    '[class*="success-toast"]',
+    'div[class*="success"]',                               # 中 - 通用成功容器
+    'div:has-text("发布成功")',                             # 中 - 文本匹配
+    'span:has-text("发布成功")',                            # 中 - 文本匹配
+    'div[class*="publish-success"]',                       # 高 - 语义匹配
+    '.toast-success',                                       # 高 - Toast 成功
+    '[class*="success-toast"]',                             # 高 - Toast 成功
+    'div[class*="toast"][class*="success"]',               # 高 - 双重限定
+    # 注意：URL 跳转检测在 xhs_publisher.py 的 _click_publish 中实现
 ]
 
 # ============================================================

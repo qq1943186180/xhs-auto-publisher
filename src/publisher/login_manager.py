@@ -4,8 +4,10 @@
 """
 
 import json
+import os
 import asyncio
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -22,13 +24,52 @@ XHS_HOME = "https://www.xiaohongshu.com"
 XHS_CREATOR = "https://creator.xiaohongshu.com"
 XHS_LOGIN = "https://www.xiaohongshu.com/login"
 
+# ----------------------------------------------------------
+# Cookie 加密工具
+# ----------------------------------------------------------
+try:
+    from cryptography.fernet import Fernet
+    import base64
+    import hashlib
+
+    def _get_cookie_fernet() -> "Fernet":
+        """基于环境变量或自动生成的密钥创建 Fernet 实例"""
+        passphrase = os.environ.get("XHS_KEY_PASSPHRASE")
+        if not passphrase:
+            pf = Path.home() / ".xhs_key_passphrase"
+            if pf.exists():
+                try:
+                    passphrase = pf.read_text(encoding="utf-8").strip()
+                except Exception:
+                    logger.debug("读取密钥文件失败，将自动生成新密钥")
+        if not passphrase:
+            import secrets
+            passphrase = secrets.token_urlsafe(32)
+            try:
+                pf = Path.home() / ".xhs_key_passphrase"
+                pf.parent.mkdir(parents=True, exist_ok=True)
+                pf.write_text(passphrase, encoding="utf-8")
+            except Exception:
+                logger.debug("保存密钥文件失败，将在内存中保留")
+        raw_key = hashlib.sha256(passphrase.encode()).digest()
+        key = base64.urlsafe_b64encode(raw_key)
+        return Fernet(key)
+
+    _COOKIE_FERNET = _get_cookie_fernet()
+    _HAS_COOKIE_CRYPTO = True
+except ImportError:
+    _HAS_COOKIE_CRYPTO = False
+    _COOKIE_FERNET = None
+    logger.warning("cryptography not installed; cookies stored unencrypted. "
+                   "Install with: pip install cryptography")
+
 
 class LoginManager:
     """
     小红书登录管理器
 
     功能：
-    - Cookie 持久化存储与恢复
+    - Cookie 加密持久化存储与恢复
     - 登录状态检测
     - 二维码登录流程
     - 登录态定期刷新
@@ -136,7 +177,7 @@ class LoginManager:
             if cookie.get("expires", 0) > 0:
                 expire_time = datetime.fromtimestamp(cookie["expires"])
                 if expire_time < datetime.now():
-                    logger.warning(f"Cookie '{cookie['name']}' 已过期")
+                    logger.warning("Cookie '%s' 已过期", cookie['name'])
                     return False
 
         # 方法2：检查页面上的登录标志元素
@@ -144,9 +185,10 @@ class LoginManager:
             try:
                 el = await page.query_selector(selector)
                 if el and await el.is_visible():
-                    logger.debug(f"登录标志匹配: {selector}")
+                    logger.debug("登录标志匹配: %s", selector)
                     return True
             except Exception:
+                logger.debug("登录标志选择器 %s 检测异常", selector)
                 continue
 
         # 方法3：检查是否出现登录弹窗
@@ -154,9 +196,10 @@ class LoginManager:
             try:
                 el = await page.query_selector(selector)
                 if el and await el.is_visible():
-                    logger.debug(f"检测到未登录标志: {selector}")
+                    logger.debug("检测到未登录标志: %s", selector)
                     return False
             except Exception:
+                logger.debug("未登录标志选择器 %s 检测异常", selector)
                 continue
 
         # 方法4：尝试访问创作者中心
@@ -171,12 +214,13 @@ class LoginManager:
                     if el:
                         return True
                 except Exception:
+                    logger.debug("创作者中心按钮选择器 %s 检测异常", selector)
                     continue
         except Exception as e:
-            logger.debug(f"创作者中心检测异常: {e}")
+            logger.debug("创作者中心检测异常: %s", e)
 
-        # 默认假设已登录（保守策略）
-        return True
+        # 默认假设未登录（安全策略：无法确认时要求重新登录）
+        return False
 
     async def _qr_login_flow(self, page: Page, timeout: int = 300) -> bool:
         """二维码登录流程"""
@@ -189,12 +233,13 @@ class LoginManager:
         # 截图保存二维码
         qr_path = self.screenshot_dir / f"qr_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         await page.screenshot(path=str(qr_path))
-        logger.info(f"📸 二维码截图已保存: {qr_path}")
-        logger.info(f"⏳ 等待扫码登录，超时时间 {timeout} 秒...")
+        logger.info("📸 二维码截图已保存: %s", qr_path)
+        logger.info("⏳ 等待扫码登录，超时时间 %s 秒...", timeout)
 
         # 等待用户扫码
         start_time = asyncio.get_event_loop().time()
         check_interval = 3  # 每3秒检查一次
+        last_screenshot_time = start_time  # 追踪上次截图时间
 
         while (asyncio.get_event_loop().time() - start_time) < timeout:
             await asyncio.sleep(check_interval)
@@ -221,20 +266,22 @@ class LoginManager:
                         await self._save_cookies(page)
                         return True
                 except Exception:
+                    logger.debug("二维码登录检测选择器 %s 异常", selector)
                     continue
 
             # 每30秒重新截图（二维码可能刷新）
-            elapsed = asyncio.get_event_loop().time() - start_time
-            if int(elapsed) % 30 < check_interval:
+            now = asyncio.get_event_loop().time()
+            if (now - last_screenshot_time) >= 30:
                 qr_path = self.screenshot_dir / f"qr_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                 await page.screenshot(path=str(qr_path))
-                logger.info(f"📸 二维码截图已更新: {qr_path}")
+                logger.info("📸 二维码截图已更新: %s", qr_path)
+                last_screenshot_time = now
 
         logger.error("❌ 登录超时")
         return False
 
     async def _save_cookies(self, page: Page) -> None:
-        """保存当前上下文的 Cookie"""
+        """保存当前上下文的 Cookie（加密存储）"""
         try:
             cookies = await self._context.cookies()
             cookie_data = {
@@ -242,18 +289,38 @@ class LoginManager:
                 "saved_at": datetime.now().isoformat(),
                 "domain": "xiaohongshu.com",
             }
-            self._cookie_file.write_text(
-                json.dumps(cookie_data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            logger.info(f"Cookie 已保存至 {self._cookie_file}")
+            json_str = json.dumps(cookie_data, ensure_ascii=False, indent=2)
+
+            if _HAS_COOKIE_CRYPTO and _COOKIE_FERNET is not None:
+                encrypted = _COOKIE_FERNET.encrypt(json_str.encode("utf-8"))
+                self._cookie_file.write_bytes(encrypted)
+                logger.info("Cookie 已加密保存至 %s", self._cookie_file)
+            else:
+                self._cookie_file.write_text(json_str, encoding="utf-8")
+                logger.info("Cookie 已保存至 %s (未加密)", self._cookie_file)
         except Exception as e:
-            logger.error(f"保存 Cookie 失败: {e}")
+            logger.error("保存 Cookie 失败: %s", e)
 
     async def _load_cookies(self, context: BrowserContext) -> bool:
-        """从文件恢复 Cookie"""
+        """从文件恢复 Cookie（支持加密和明文格式）"""
         try:
-            data = json.loads(self._cookie_file.read_text(encoding="utf-8"))
+            raw = self._cookie_file.read_bytes()
+
+            # 尝试 Fernet 解密
+            json_str = None
+            if _HAS_COOKIE_CRYPTO and _COOKIE_FERNET is not None:
+                try:
+                    json_str = _COOKIE_FERNET.decrypt(raw).decode("utf-8")
+                except Exception:
+                    # 不是 Fernet 格式，当作明文处理
+                    logger.debug("Cookie 非 Fernet 加密格式，尝试明文解析")
+                    json_str = None
+
+            if json_str is None:
+                # 旧格式明文 JSON
+                json_str = raw.decode("utf-8")
+
+            data = json.loads(json_str)
             cookies = data.get("cookies", [])
             if not cookies:
                 return False
@@ -269,7 +336,7 @@ class LoginManager:
             await context.add_cookies(cookies)
             return True
         except Exception as e:
-            logger.error(f"加载 Cookie 失败: {e}")
+            logger.error("加载 Cookie 失败: %s", e)
             return False
 
     async def refresh_login_if_needed(
@@ -315,4 +382,5 @@ class LoginManager:
             try:
                 await self._context.close()
             except Exception:
+                logger.debug("Handled exception")
                 pass

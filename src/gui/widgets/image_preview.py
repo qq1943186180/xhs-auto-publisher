@@ -9,6 +9,7 @@ from PyQt5.QtGui import QPixmap
 from qfluentwidgets import PrimaryPushButton
 
 from ..styles.theme import BG_CARD, BORDER, TEXT_PRIMARY, TEXT_SECONDARY, PRIMARY, PRIMARY_LIGHT, RADIUS_MD
+from ..workers.image_loader import AsyncImageLoader, _create_placeholder_pixmap
 
 
 class ImagePreview(QWidget):
@@ -19,6 +20,9 @@ class ImagePreview(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._images = []  # list of file paths
+        self._image_loader = AsyncImageLoader(self)
+        self._image_loader.image_loaded.connect(self._on_async_image_loaded)
+        self._thumbnail_widgets = []  # 跟踪缩略图 widget，用于精确删除
         self._setup_ui()
 
     def _setup_ui(self):
@@ -77,7 +81,7 @@ class ImagePreview(QWidget):
         self._update_visibility()
 
     def _add_thumbnail(self, path: str, index: int):
-        """添加缩略图"""
+        """添加缩略图（使用异步加载）"""
         frame = QWidget()
         frame.setFixedSize(100, 100)
         frame.setStyleSheet(f"""
@@ -95,16 +99,12 @@ class ImagePreview(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
 
-        # 图片
+        # 图片（使用异步加载器）
         img_label = QLabel()
         img_label.setAlignment(Qt.AlignCenter)
-        pixmap = QPixmap(path)
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(80, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            img_label.setPixmap(scaled)
-        else:
-            img_label.setText("无法读取")
-            img_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        placeholder = _create_placeholder_pixmap(80, 70, "加载中...")
+        img_label.setPixmap(placeholder)
+        self._image_loader.load_single(index, path, 80, 70)
         layout.addWidget(img_label, alignment=Qt.AlignCenter)
 
         # 删除按钮
@@ -135,25 +135,54 @@ class ImagePreview(QWidget):
         del_btn.resize(20, 20)
 
         self.image_layout.addWidget(frame)
+        self._thumbnail_widgets.append(frame)
+
+    def _on_async_image_loaded(self, index: int, path: str, pixmap):
+        """异步图片加载完成回调"""
+        # 通过 index 找到对应的 img_label 并更新
+        if 0 <= index < len(self._images):
+            # 找到对应 frame 中的 img_label
+            layout_items = self.image_layout.count()
+            if index < layout_items:
+                item = self.image_layout.itemAt(index)
+                if item and item.widget():
+                    frame = item.widget()
+                    if frame.layout() and frame.layout().count() > 0:
+                        img_item = frame.layout().itemAt(0)
+                        if img_item and img_item.widget() and isinstance(img_item.widget(), QLabel):
+                            img_item.widget().setPixmap(pixmap)
 
     def _remove_image(self, index: int):
-        """移除图片"""
+        """移除图片 — 只移除对应 widget，不重建全部"""
         if 0 <= index < len(self._images):
             self._images.pop(index)
-            self._rebuild_thumbnails()
+
+            # 只移除对应的 widget
+            if index < self.image_layout.count():
+                item = self.image_layout.takeAt(index)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            # 更新删除按钮的索引（因为列表已移位）
+            self._rebind_delete_buttons()
             self.image_removed.emit(index)
-
-    def _rebuild_thumbnails(self):
-        """重建缩略图"""
-        while self.image_layout.count():
-            item = self.image_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for i, path in enumerate(self._images):
-            self._add_thumbnail(path, i)
-
         self._update_visibility()
+
+    def _rebind_delete_buttons(self):
+        """重新绑定删除按钮的索引"""
+        for i in range(self.image_layout.count()):
+            item = self.image_layout.itemAt(i)
+            if item and item.widget():
+                frame = item.widget()
+                # 找到 del_btn
+                for child in frame.findChildren(PrimaryPushButton):
+                    if child.text() == "×":
+                        try:
+                            child.clicked.disconnect()
+                        except (TypeError, RuntimeError):
+                            logger.debug("Caught Exception, continuing")
+                        child.clicked.connect(lambda checked, idx=i: self._remove_image(idx))
+                        break
 
     def _update_visibility(self):
         """更新可见性"""
@@ -168,13 +197,21 @@ class ImagePreview(QWidget):
     def clear(self):
         """清空所有图片"""
         self._images.clear()
-        self._rebuild_thumbnails()
+        # 清空所有 widget
+        while self.image_layout.count():
+            item = self.image_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._thumbnail_widgets.clear()
+        self._update_visibility()
 
     def set_images(self, paths: list):
         """设置图片列表"""
-        self._images.clear()
-        self._rebuild_thumbnails()
+        self.clear()
         self.add_images(paths)
 
     def setFixedHeight(self, h):
         super().setFixedHeight(h)
+
+import logging
+logger = logging.getLogger(__name__)

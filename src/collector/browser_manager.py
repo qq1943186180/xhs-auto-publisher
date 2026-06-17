@@ -9,9 +9,8 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-from contextlib import asynccontextmanager
+import time
+from typing import Optional
 
 from playwright.async_api import async_playwright, BrowserContext, Page
 
@@ -142,7 +141,7 @@ class BrowserManager:
                 await self._context.close()
                 logger.debug("浏览器上下文已关闭")
         except Exception as e:
-            logger.error(f"关闭浏览器时出错: {e}")
+            logger.error("关闭浏览器时出错: %s", e)
         finally:
             if self._playwright:
                 await self._playwright.stop()
@@ -154,15 +153,31 @@ class BrowserManager:
     # ── Cookie 管理 ─────────────────────────────────────────────────────
 
     async def _save_cookies(self):
-        """保存当前上下文的 Cookie 到本地文件"""
+        """保存当前上下文的 Cookie 到本地文件（过滤过期 Cookie）"""
         try:
             cookies = await self._context.cookies()
             if cookies:
+                # 过滤已过期的 Cookie
+                now_ts = int(time.time())
+                valid_cookies = []
+                for c in cookies:
+                    # expires == -1 表示会话 Cookie，保留
+                    # expires == 0 表示浏览器关闭时过期，保留
+                    # expires > 0 表示有明确过期时间，检查是否过期
+                    expires = c.get("expires", -1)
+                    if expires > 0 and expires < now_ts:
+                        logger.debug("过滤过期 Cookie: %s (domain=%s)", c.get('name'), c.get('domain'))
+                        continue
+                    valid_cookies.append(c)
+
                 with open(self.cookie_file, "w", encoding="utf-8") as f:
-                    json.dump(cookies, f, ensure_ascii=False, indent=2)
-                logger.info(f"Cookie 已保存: {self.cookie_file} ({len(cookies)} 条)")
+                    json.dump(valid_cookies, f, ensure_ascii=False, indent=2)
+                logger.info(
+                    f"Cookie 已保存: {self.cookie_file} "
+                    f"({len(valid_cookies)} 条有效, {len(cookies) - len(valid_cookies)} 条过期已过滤)"
+                )
         except Exception as e:
-            logger.error(f"保存 Cookie 失败: {e}")
+            logger.error("保存 Cookie 失败: %s", e)
 
     async def _load_cookies(self):
         """从本地文件加载 Cookie 到当前上下文"""
@@ -174,11 +189,20 @@ class BrowserManager:
             with open(self.cookie_file, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
 
-            if cookies:
-                await self._context.add_cookies(cookies)
-                logger.info(f"Cookie 已加载: {len(cookies)} 条")
+            # 过滤过期 Cookie
+            now_ts = int(time.time())
+            valid_cookies = []
+            for c in cookies:
+                expires = c.get("expires", -1)
+                if expires > 0 and expires < now_ts:
+                    continue
+                valid_cookies.append(c)
+
+            if valid_cookies:
+                await self._context.add_cookies(valid_cookies)
+                logger.info("Cookie 已加载: %s 条有效", len(valid_cookies))
         except Exception as e:
-            logger.error(f"加载 Cookie 失败: {e}")
+            logger.error("加载 Cookie 失败: %s", e)
 
     async def save_cookies(self):
         """手动触发 Cookie 保存（公开方法）"""
@@ -200,7 +224,25 @@ class BrowserManager:
                 logger.info("未登录：当前在登录页")
                 return False
 
-            # 检查页面是否包含登录相关元素
+            # 正向检查：用户名/头像元素（创作者中心）
+            positive_indicators = [
+                'div.user-info',
+                'img.user-avatar',
+                'span.user-name',
+                '.creator-header .user-info',
+                '.creator-header img[class*="avatar"]',
+                'div.side-bar .user',
+            ]
+            for sel in positive_indicators:
+                try:
+                    el = await self.page.query_selector(sel)
+                    if el and await el.is_visible():
+                        logger.info("已登录：检测到用户元素 (%s)", sel)
+                        return True
+                except Exception:
+                    continue
+
+            # 检查页面是否包含登录相关元素（负面指标）
             login_btn = await self.page.query_selector(
                 'text="登录", button:has-text("登录"), .login-btn, [class*="login"]'
             )
@@ -208,23 +250,20 @@ class BrowserManager:
                 logger.info("未登录：页面存在登录按钮")
                 return False
 
-            # 检查是否能正常访问后台内容（如侧边栏、商品管理等）
-            sidebar = await self.page.query_selector(
-                '[class*="sidebar"], [class*="menu"], [class*="nav"]'
-            )
-            if sidebar:
-                logger.info("已登录：检测到后台导航元素")
-                return True
-
             # 兜底：检查 URL 是否仍在后台域
             if "ark.xiaohongshu.com" in current_url and "login" not in current_url:
-                logger.info("已登录：URL 在后台域且非登录页")
-                return True
+                # 再检查一下侧边栏/导航是否存在
+                sidebar = await self.page.query_selector(
+                    '[class*="sidebar"], [class*="menu"], [class*="nav"]'
+                )
+                if sidebar:
+                    logger.info("已登录：URL 在后台域且检测到导航元素")
+                    return True
 
             return False
 
         except Exception as e:
-            logger.error(f"检测登录状态失败: {e}")
+            logger.error("检测登录状态失败: %s", e)
             return False
 
     # ── 扫码登录 ────────────────────────────────────────────────────────
@@ -248,15 +287,16 @@ class BrowserManager:
             logger.info("正在打开千帆后台...")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(3)
-            
+
             logger.info("请在浏览器中扫码登录...")
-            logger.info(f"等待扫码登录（最多 {timeout} 秒）...")
+            logger.info("等待扫码登录（最多 %s 秒）...", timeout)
 
             # 轮询检测登录状态（不刷新页面）
-            start_time = asyncio.get_event_loop().time()
-            while (asyncio.get_event_loop().time() - start_time) < timeout:
+            # 使用 time.monotonic() 替代 asyncio.get_event_loop().time()，更可靠
+            start_time = time.monotonic()
+            while (time.monotonic() - start_time) < timeout:
                 current_url = self.page.url
-                
+
                 # 检查是否已离开登录页
                 if "login" not in current_url and "passport" not in current_url:
                     # 检查是否在后台页面
@@ -268,7 +308,7 @@ class BrowserManager:
                             await self._save_cookies()
                             logger.info("扫码登录成功，Cookie 已保存")
                             return True
-                
+
                 # 等待2秒再检测
                 await asyncio.sleep(2)
 
@@ -276,7 +316,7 @@ class BrowserManager:
             return False
 
         except Exception as e:
-            logger.error(f"扫码登录流程出错: {e}")
+            logger.error("扫码登录流程出错: %s", e)
             return False
 
     # ── 页面操作辅助 ────────────────────────────────────────────────────
@@ -287,8 +327,15 @@ class BrowserManager:
         return page
 
     async def goto(self, url: str, **kwargs) -> None:
-        """导航到指定 URL，带随机延迟"""
-        await self.page.goto(url, wait_until="domcontentloaded", **kwargs)
+        """导航到指定 URL，带随机延迟和等待"""
+        # 使用 domcontentloaded 而非 load，更稳定
+        kwargs.setdefault("wait_until", "domcontentloaded")
+        await self.page.goto(url, **kwargs)
+        # 等待页面基本可用
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            logger.debug("Page load timeout, continuing")
         await AntiDetect.human_like_delay(1.0, 2.5)
 
     async def screenshot(self, path: str, **kwargs) -> None:

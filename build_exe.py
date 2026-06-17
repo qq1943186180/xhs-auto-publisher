@@ -8,33 +8,50 @@ import shutil
 import subprocess
 
 
-def build():
-    """Execute build"""
-    # Change to project directory
-    project_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(project_dir)
-    
-    print("=" * 50)
-    print("XHS Auto Publisher - Build Tool")
-    print("=" * 50)
+def _get_version():
+    """从 src/__init__.py 读取版本号"""
+    init_path = os.path.join("src", "__init__.py")
+    if os.path.exists(init_path):
+        with open(init_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("__version__"):
+                    return line.split("=")[1].strip().strip('"').strip("'")
+    return "1.0.0"
 
-    # Clean old build files
+
+def _cleanup():
+    """清理构建中间产物"""
     for d in ["build", "dist", "__pycache__"]:
         if os.path.exists(d):
             print(f"Cleaning: {d}/")
-            shutil.rmtree(d)
+            shutil.rmtree(d, ignore_errors=True)
 
     for f in os.listdir("."):
         if f.endswith(".spec"):
             os.remove(f)
             print(f"Cleaning: {f}")
 
+
+def build():
+    """Execute build"""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(project_dir)
+
+    version = _get_version()
+    print("=" * 50)
+    print(f"XHS Auto Publisher v{version} - Build Tool")
+    print("=" * 50)
+
+    # Clean old build files
+    _cleanup()
+
     # PyInstaller arguments
+    exe_name = f"xhs-auto-publisher-{version}" if sys.platform == "win32" else f"xhs-auto-publisher-{version}"
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--windowed",
-        "--name=xhs-auto-publisher",
+        f"--name={exe_name}",
         "--icon=NONE",
         "--add-data=README.md;.",
         "--hidden-import=sqlalchemy",
@@ -56,11 +73,16 @@ def build():
     print(f"\nRunning:\n{' '.join(cmd)}\n")
     print("Building, please wait...\n")
 
-    result = subprocess.run(cmd, capture_output=False)
+    try:
+        result = subprocess.run(cmd, capture_output=False)
+    except Exception as e:
+        print(f"\n[FAIL] Build process error: {e}")
+        _cleanup()
+        sys.exit(1)
 
     if result.returncode == 0:
-        exe_name = "xhs-auto-publisher.exe" if sys.platform == "win32" else "xhs-auto-publisher"
-        exe_path = os.path.join("dist", exe_name)
+        exe_ext = ".exe" if sys.platform == "win32" else ""
+        exe_path = os.path.join("dist", f"{exe_name}{exe_ext}")
         print(f"\n[OK] Build successful!")
         print(f"Output: {os.path.abspath('dist')}")
         print(f"File: {os.path.abspath(exe_path)}")
@@ -70,16 +92,12 @@ def build():
             print(f"Size: {size_mb:.1f} MB")
     else:
         print(f"\n[FAIL] Build failed, exit code: {result.returncode}")
+        _cleanup()
         sys.exit(1)
 
-    # Clean build intermediates
-    if os.path.exists("build"):
-        shutil.rmtree("build")
-    for f in os.listdir("."):
-        if f.endswith(".spec"):
-            os.remove(f)
-
-    print("\nCleanup done.")
+    # Clean build intermediates on success
+    _cleanup()
+    print("\nDone.")
 
 
 if __name__ == "__main__":

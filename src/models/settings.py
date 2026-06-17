@@ -4,7 +4,7 @@
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean
 
-from src.database.db_manager import Base
+from src.database.base import Base
 
 
 class Settings(Base):

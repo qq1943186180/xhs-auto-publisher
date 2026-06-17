@@ -1,6 +1,10 @@
 """
 Settings Page - PyQt-Fluent-Widgets
 """
+import json
+import logging
+import os
+
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QLabel, QScrollArea
 from PyQt5.QtCore import Qt, pyqtSignal
 
@@ -14,6 +18,9 @@ from src.gui.styles.theme import (
     page_title_style,
     section_title_style,
 )
+from src.gui.utils import PAGE_MARGINS
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsPage(QWidget):
@@ -27,7 +34,7 @@ class SettingsPage(QWidget):
 
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(24, 24, 24, 36)
+        main_layout.setContentsMargins(PAGE_MARGINS)
         main_layout.setSpacing(16)
 
         header = QVBoxLayout()
@@ -190,26 +197,47 @@ class SettingsPage(QWidget):
                 km.add_key(Provider.OPENAI, data["openai_key"], base_url=base_url)
             if data["kimi_key"]:
                 km.add_key(Provider.KIMI, data["kimi_key"])
+        except ImportError as e:
+            logger.error("API key manager module not found: %s", e)
+            InfoBar.error("保存失败", f"API 模块导入失败: {e}", parent=self)
+            return
+        except AttributeError as e:
+            logger.error("API key manager attribute error: %s", e)
+            InfoBar.error("保存失败", f"API 配置异常: {e}", parent=self)
+            return
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Save API keys failed: {e}")
+            logger.error("Save API keys failed: %s", e)
+            InfoBar.error("保存失败", f"API 密钥保存失败: {e}", parent=self)
+            return
 
         # Save other settings to config file
-        import json, os
         config_path = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "config.json")
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        config = {}
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        config.update({
-            "headless": data["headless"],
-            "images_per_product": data["images_per_product"],
-            "publish_interval": data["interval"],
-            "max_daily": data["max_daily"],
-        })
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        try:
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            config.update({
+                "headless": data["headless"],
+                "images_per_product": data["images_per_product"],
+                "publish_interval": data["interval"],
+                "max_daily": data["max_daily"],
+            })
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except json.JSONDecodeError as e:
+            logger.error("Config file corrupted: %s", e)
+            InfoBar.error("保存失败", f"配置文件格式错误: {e}", parent=self)
+            return
+        except PermissionError as e:
+            logger.error("Permission denied writing config: %s", e)
+            InfoBar.error("保存失败", f"权限不足: {e}", parent=self)
+            return
+        except Exception as e:
+            logger.error("Save config failed: %s", e)
+            InfoBar.error("保存失败", f"配置保存失败: {e}", parent=self)
+            return
 
         self.settings_changed.emit(data)
         InfoBar.success("保存成功", "设置已更新并加密保存", parent=self)
@@ -226,15 +254,25 @@ class SettingsPage(QWidget):
                         self.openai_base_edit.setText(entry.base_url)
                 elif entry.provider.value == "kimi":
                     self.kimi_key_edit.setText("••••••••")
-        except:
-            pass
+        except ImportError as e:
+            logger.warning("API key manager module not found: %s", e)
+        except AttributeError as e:
+            logger.warning("API key manager attribute error: %s", e)
+        except Exception as e:
+            logger.warning("Load API keys failed: %s", e)
 
-        import json, os
         config_path = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            self.headless_switch.setChecked(config.get("headless", False))
-            self.images_per_product_spin.setValue(config.get("images_per_product", 5))
-            self.interval_spin.setValue(config.get("publish_interval", 300))
-            self.daily_spin.setValue(config.get("max_daily", 10))
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                self.headless_switch.setChecked(config.get("headless", False))
+                self.images_per_product_spin.setValue(config.get("images_per_product", 5))
+                self.interval_spin.setValue(config.get("publish_interval", 300))
+                self.daily_spin.setValue(config.get("max_daily", 10))
+        except json.JSONDecodeError as e:
+            logger.warning("Config file corrupted: %s", e)
+        except PermissionError as e:
+            logger.warning("Permission denied reading config: %s", e)
+        except Exception as e:
+            logger.warning("Load config failed: %s", e)

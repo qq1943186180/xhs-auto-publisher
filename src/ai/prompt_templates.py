@@ -1,8 +1,19 @@
 """
 小红书提示词模板库
 自然口吻：具体场景 + 真实细节 + 克制推荐
+
+本模块集中管理所有 LLM 提示词模板，包括：
+- 标题生成：TITLE_SYSTEM_PROMPT / TITLE_USER_TEMPLATE
+- 文案生成：CONTENT_SYSTEM_PROMPT / CONTENT_USER_TEMPLATE（种草/测评/教程三种风格）
+- 话题标签：TAGS_SYSTEM_PROMPT / TAGS_USER_TEMPLATE
+- 小红书主图：XHS_IMAGE_PROMPTS（3种风格变体：博主风/纯白简约/氛围场景）
+- 方向生成（第一轮）：DIRECTION_SYSTEM_PROMPT / DIRECTION_USER_TEMPLATE
+- 方向扩写（第二轮）：DIRECTION_CONTENT_SYSTEM_PROMPT / DIRECTION_CONTENT_USER_TEMPLATE
+
+辅助函数 get_*_prompt() 负责格式化模板，由各生成器模块调用。
 """
 
+import re
 from typing import Optional
 
 
@@ -281,6 +292,192 @@ STYLE_ALIASES = {
 }
 
 
+IMAGE_PRODUCT_PROFILES = [
+    {
+        "category": "jewelry or wearable accessory",
+        "keywords": ["手串", "手链", "项链", "吊坠", "挂件", "戒指", "耳环", "耳饰", "耳钉", "玉", "翡翠", "玛瑙", "水晶", "珍珠", "银饰", "配饰"],
+        "usage": "worn on the wrist, neck, finger, bag strap, or placed near outfit fabrics",
+        "props": "soft linen sleeve, jewelry tray, small mirror, muted textile, tea cup, clean hand pose",
+        "avoid": "oversized studio jewelry ads, fantasy glow, changing the stone color or bead arrangement",
+        "scenes": [
+            "a real outfit-check moment near a window, the accessory worn naturally with a sleeve slightly pushed up",
+            "a quiet dressing-table detail shot, the accessory resting near fabric folds and a small mirror",
+            "a casual cafe or tea-table moment, the accessory visible while the hand is reaching for a cup",
+        ],
+    },
+    {
+        "category": "clothing, shoes, or bag",
+        "keywords": ["衣", "裙", "裤", "鞋", "包", "帽", "外套", "毛衣", "卫衣", "衬衫", "汉服", "吊带"],
+        "usage": "worn in a full or half-body styling moment",
+        "props": "mirror, doorway, simple room background, tote bag, neutral floor, natural outfit layers",
+        "avoid": "runway poses, catalog-white background unless specifically requested, changing fabric cut or print",
+        "scenes": [
+            "a mirror outfit check before going out, with natural room clutter kept subtle",
+            "a street or cafe doorway candid shot, focused on how the item sits on the body",
+            "a flat-lay styling scene with shoes, bag, and folded layers arranged casually",
+        ],
+    },
+    {
+        "category": "beauty or personal care product",
+        "keywords": ["口红", "唇", "面霜", "精华", "护肤", "香水", "彩妆", "粉底", "洗发", "沐浴", "面膜", "防晒"],
+        "usage": "used on a vanity, bathroom shelf, or makeup routine scene",
+        "props": "small towel, mirror edge, cotton pad, water droplets, warm bathroom light, clean vanity",
+        "avoid": "medical claims, fake before-after results, changing packaging label shape",
+        "scenes": [
+            "a morning vanity routine with the product just picked up by hand",
+            "a bathroom shelf detail shot with water droplets and a folded towel nearby",
+            "a small bag or makeup pouch scene, as if the product is carried for the day",
+        ],
+    },
+    {
+        "category": "home object or decor",
+        "keywords": ["杯", "碗", "盘", "壶", "花瓶", "摆件", "香薰", "灯", "收纳", "枕", "毯", "家居", "桌布"],
+        "usage": "placed in a lived-in home corner or tabletop scene",
+        "props": "wood table, soft curtain light, plant leaf, book, tray, fabric texture, everyday household details",
+        "avoid": "empty showroom scenes, perfect render-like symmetry, changing material texture",
+        "scenes": [
+            "a lived-in dining or desk corner with the object already in use",
+            "a soft afternoon home scene with curtains, plant shadows, and real tabletop marks",
+            "a close detail shot showing texture and scale beside ordinary home items",
+        ],
+    },
+    {
+        "category": "food, tea, coffee, or snack",
+        "keywords": ["茶", "咖啡", "零食", "饼", "糖", "果", "酒", "饮", "蜂蜜", "糕", "坚果", "牛奶"],
+        "usage": "shown as something being opened, poured, tasted, or shared",
+        "props": "plate, cup, napkin, wooden tray, kitchen counter, crumbs, afternoon light",
+        "avoid": "fake nutrition claims, plastic-looking food, changing package design",
+        "scenes": [
+            "an opening-and-tasting moment on a kitchen counter with natural small mess",
+            "an afternoon snack table with one portion served and packaging still visible",
+            "a close-up of texture beside a cup or plate, with realistic crumbs or condensation",
+        ],
+    },
+    {
+        "category": "digital accessory or small device",
+        "keywords": ["手机", "耳机", "键盘", "鼠标", "充电", "平板", "相机", "支架", "数据线", "音箱"],
+        "usage": "used on a real desk, commute, charging, or setup scene",
+        "props": "laptop, notebook, cable, desk lamp, bag pocket, soft screen glow, practical workspace",
+        "avoid": "futuristic sci-fi effects, changing ports/buttons, unreadable fake UI text",
+        "scenes": [
+            "a real desk setup during work, with cables and notebook arranged naturally",
+            "a bag or commute detail shot showing how the item is carried",
+            "a close functional shot while the item is being plugged in, held, or adjusted",
+        ],
+    },
+    {
+        "category": "stationery or creative tool",
+        "keywords": ["笔", "本", "贴纸", "手账", "文具", "印章", "便签", "画笔", "胶带"],
+        "usage": "used in journaling, note-taking, planning, or craft moments",
+        "props": "open notebook, paper scraps, pen marks, washi tape, desk lamp, soft shadow",
+        "avoid": "perfectly sterile office stock photo, fake readable text, changing product pattern",
+        "scenes": [
+            "a real desk note-taking moment with the item mid-use",
+            "a journaling flat-lay with paper layers and small imperfect alignment",
+            "a close-up of texture, tip, paper edge, or storage detail in warm light",
+        ],
+    },
+]
+
+DEFAULT_IMAGE_PROFILE = {
+    "category": "small lifestyle product",
+    "usage": "placed or used in a believable daily-life moment",
+    "props": "simple real-life props that match the product, natural textures, hands only if useful",
+    "avoid": "generic stock-photo composition, changing the product identity, fake text or logos",
+    "scenes": [
+        "a first-use moment in a real home or desk setting that naturally fits this exact product",
+        "a detail review photo showing material, scale, and how it sits with nearby daily items",
+        "a candid lifestyle scene where the product is being carried, touched, placed, or used",
+    ],
+}
+
+
+def _clean_product_name(product_name: str) -> str:
+    text = re.sub(r"\s+", " ", product_name or "").strip()
+    return text[:120] or "the product"
+
+
+def _infer_image_profile(product_name: str) -> dict:
+    text = product_name or ""
+    for profile in IMAGE_PRODUCT_PROFILES:
+        if any(keyword in text for keyword in profile["keywords"]):
+            return profile
+    return DEFAULT_IMAGE_PROFILE
+
+
+def _extra_visual_cues(product_name: str, product_context: str = "") -> str:
+    text = f"{product_name} {product_context}"
+    cues = []
+    cue_rules = [
+        (["夏", "清凉"], "fresh summer light, breathable fabrics, airy composition"),
+        (["显白"], "skin-tone friendly natural light, but no artificial skin whitening"),
+        (["中式", "国风", "汉服"], "subtle Chinese-style textile or tea-table detail, modern and restrained"),
+        (["原创", "手作", "手工"], "small designer-handmade feeling, tactile imperfections, no factory catalog look"),
+        (["绿", "翡翠", "碧玉"], "soft green-adjacent props, avoid changing the actual product color"),
+        (["粉"], "gentle pink or blush accent props only if they match the product"),
+        (["黑"], "clean contrast with off-white or gray props, keep highlights controlled"),
+        (["儿童", "宝宝"], "safe, soft, parent-friendly daily scene, no exaggerated claims"),
+        (["通勤", "上班"], "commute or workday scene, practical and calm"),
+        (["礼物", "送"], "gift-opening moment, subtle ribbon or box detail, no readable greeting text"),
+    ]
+    for keywords, cue in cue_rules:
+        if any(keyword in text for keyword in keywords):
+            cues.append(cue)
+    return "; ".join(cues) if cues else "infer color, material, scale, and usage details from the attached image"
+
+
+def _build_dynamic_image_prompt(
+    product_name: str,
+    style: str,
+    scene_index: int,
+    product_context: str = "",
+) -> str:
+    product = _clean_product_name(product_name)
+    profile = _infer_image_profile(product)
+    scenes = profile["scenes"]
+    scene = scenes[scene_index % len(scenes)]
+    visual_cues = _extra_visual_cues(product, product_context)
+    context_line = f"\nAdditional product/context notes: {product_context[:500]}" if product_context else ""
+
+    style_guides = {
+        "style_a": (
+            "Real user lifestyle photo. The moment should feel like someone just noticed the product in daily life, "
+            "not a planned advertisement."
+        ),
+        "style_b": (
+            "Detail review photo. Emphasize material, size, texture, finish, and how the product looks in ordinary light."
+        ),
+        "style_c": (
+            "Candid usage scene. Show a small story around the product: being worn, held, opened, placed, or used."
+        ),
+    }
+    camera_guides = [
+        "phone camera, natural depth of field, slight handheld imperfection, realistic shadows",
+        "close but not macro-only, true-to-life color, small dust/fabric/water/desk details where appropriate",
+        "warm natural light or soft indoor light, not HDR, not CGI, not studio-perfect",
+    ]
+
+    return f"""Use the attached product image as the visual reference. Generate ONE new photo-realistic Xiaohongshu-style product image.
+
+Product title: {product}
+Inferred product type: {profile["category"]}
+Natural use case: {profile["usage"]}
+Scene idea for this product: {scene}
+Product-specific visual cues: {visual_cues}
+Useful nearby props: {profile["props"]}
+Avoid for this product: {profile["avoid"]}{context_line}
+
+Style direction: {style_guides.get(style, style_guides["style_a"])}
+Camera and realism: {camera_guides[scene_index % len(camera_guides)]}.
+
+Critical reference rules:
+- The product itself must stay visually identical to the attached image: same shape, color, material, pattern, bead order, package shape, labels, and proportions.
+- Do not invent a different product, do not redesign it, and do not turn it into an illustration.
+- Pick props, background, hand pose, and angle that naturally match this exact product type and title.
+- Do not add readable text, watermark, logo, UI overlay, before-after claims, or exaggerated commercial slogans.
+- The final image should look like a real Xiaohongshu note photo taken by a normal user with a phone."""
+
+
 # ============================================================
 # 辅助函数
 # ============================================================
@@ -344,18 +541,25 @@ def get_tags_prompt(
 def get_image_prompt(
     product_name: str,
     style: str = "style_a",
+    product_context: str = "",
 ) -> str:
     """获取小红书主图生成提示词（3种风格）"""
-    template = XHS_IMAGE_PROMPTS.get(style, XHS_IMAGE_PROMPTS["style_a"])
-    return template.format(product_name=product_name)
+    style_order = ["style_a", "style_b", "style_c"]
+    scene_index = style_order.index(style) if style in style_order else 0
+    return _build_dynamic_image_prompt(
+        product_name=product_name,
+        style=style,
+        scene_index=scene_index,
+        product_context=product_context,
+    )
 
 
-def get_all_image_prompts(product_name: str) -> list[str]:
+def get_all_image_prompts(product_name: str, product_context: str = "") -> list[str]:
     """获取全部3种风格的提示词"""
     return [
-        get_image_prompt(product_name, "style_a"),
-        get_image_prompt(product_name, "style_b"),
-        get_image_prompt(product_name, "style_c"),
+        get_image_prompt(product_name, "style_a", product_context=product_context),
+        get_image_prompt(product_name, "style_b", product_context=product_context),
+        get_image_prompt(product_name, "style_c", product_context=product_context),
     ]
 
 

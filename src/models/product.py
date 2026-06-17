@@ -2,10 +2,10 @@
 产品数据模型
 """
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, Float
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, Float, JSON
 from sqlalchemy.orm import relationship
 
-from src.database.db_manager import Base
+from src.database.base import Base
 
 
 class Product(Base):
@@ -18,10 +18,15 @@ class Product(Base):
     category = Column(String(100), comment="产品分类")
     tags = Column(Text, comment="标签，逗号分隔")
     price = Column(Float, comment="价格")
+    original_price = Column(Float, comment="原价")
     images_dir = Column(String(500), comment="图片目录路径")
     video_path = Column(String(500), comment="视频文件路径")
     cover_image = Column(String(500), comment="封面图片路径")
-    status = Column(String(20), default="draft", comment="状态: draft/ready/published/archived")
+    main_images = Column(JSON, default=list, comment="主图 URL 列表（采集器填充）")
+    detail_images = Column(JSON, default=list, comment="详情图 URL 列表（采集器填充）")
+    local_images = Column(JSON, default=list, comment="下载后的本地图片路径列表")
+    sku_data = Column(JSON, default=list, comment="SKU 信息列表")
+    status = Column(String(20), default="active", comment="状态: active/inactive/draft")
     xhs_note_id = Column(String(100), comment="小红书笔记ID")
     extra_data = Column(Text, comment="扩展数据 JSON")
     is_active = Column(Boolean, default=True, comment="是否启用")
@@ -30,7 +35,7 @@ class Product(Base):
 
     # 关系
     tasks = relationship("Task", back_populates="product", cascade="all, delete-orphan")
-    publish_history = relationship("PublishHistory", back_populates="product", cascade="all, delete-orphan")
+    publish_history = relationship("PublishHistory", back_populates="product", cascade="save-update, merge")
 
     def __repr__(self):
         return f"<Product(id={self.id}, title='{self.title}', status='{self.status}')>"
@@ -43,9 +48,14 @@ class Product(Base):
             "category": self.category,
             "tags": self.tags,
             "price": self.price,
+            "original_price": self.original_price,
             "images_dir": self.images_dir,
             "video_path": self.video_path,
             "cover_image": self.cover_image,
+            "main_images": self.main_images or [],
+            "detail_images": self.detail_images or [],
+            "local_images": self.local_images or [],
+            "sku_data": self.sku_data or [],
             "status": self.status,
             "xhs_note_id": self.xhs_note_id,
             "extra_data": self.extra_data,

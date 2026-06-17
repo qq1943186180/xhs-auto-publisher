@@ -7,7 +7,7 @@ import subprocess
 import sys
 import logging
 from pathlib import Path
-from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QLabel, QTableWidgetItem, QFrame
+from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QLabel, QTableWidgetItem, QFrame, QMessageBox
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap
 
@@ -27,6 +27,9 @@ from src.gui.styles.theme import (
     page_subtitle_style,
     page_title_style,
 )
+from src.gui.utils import PAGE_MARGINS, status_label
+from src.gui.widgets.status_badge import StatusBadge
+from src.gui.workers.image_loader import AsyncImageLoader
 
 logger = logging.getLogger(__name__)
 
@@ -44,16 +47,19 @@ class TaskListPage(QWidget):
     collect_done = pyqtSignal()
 
     def __init__(self, parent=None):
+        super().__init__(parent)
         self._products = []
         self._collect_process = None
+        self._collect_process_started = False  # 进程互斥标志
         self._poll_timer = QTimer()
         self._poll_timer.timeout.connect(self._check_collect_done)
-        super().__init__(parent)
+        self._image_loader = AsyncImageLoader(self)
+        self._image_loader.image_loaded.connect(self._on_image_loaded)
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setContentsMargins(PAGE_MARGINS)
         layout.setSpacing(16)
 
         # Title
@@ -151,7 +157,7 @@ class TaskListPage(QWidget):
                 value = int(config.get("images_per_product", IMAGES_PER_PRODUCT))
                 return max(1, min(9, value))
         except Exception as e:
-            logger.warning(f"Load images_per_product failed: {e}")
+            logger.warning("Load images_per_product failed: %s", e)
         return IMAGES_PER_PRODUCT
 
     def _on_select_all_changed(self, state):
@@ -175,30 +181,25 @@ class TaskListPage(QWidget):
             title_item.setData(Qt.UserRole, p)
             self.table.setItem(row, 1, title_item)
 
-            # Image
+            # Image (async load)
             img_label = QLabel()
             img_label.setAlignment(Qt.AlignCenter)
             local_imgs = p.get("local_images", [])
             existing_imgs = [img for img in local_imgs if os.path.exists(img)]
             if existing_imgs:
-                pixmap = QPixmap(existing_imgs[0])
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    img_label.setPixmap(scaled)
-                    img_label.setToolTip(f"已采集 {len(existing_imgs)}/{self._images_per_product()} 张")
+                self._image_loader.load_single(row, existing_imgs[0], 48, 48)
+                img_label.setToolTip(f"已采集 {len(existing_imgs)}/{self._images_per_product()} 张")
             else:
                 img_label.setText("无图")
                 img_label.setStyleSheet(f"color: {TEXT_MUTED};")
                 img_label.setToolTip(f"已采集 0/{self._images_per_product()} 张")
             self.table.setCellWidget(row, 2, img_label)
 
-            # Status
+            # Status (Chinese label)
             status = p.get("status", "pending")
-            status_label = QLabel(status)
-            status_label.setAlignment(Qt.AlignCenter)
-            colors = {"pending": WARNING, "done": SUCCESS, "generating": INFO}
-            status_label.setStyleSheet(f"color: {colors.get(status, TEXT_MUTED)}; font-weight: 600;")
-            self.table.setCellWidget(row, 3, status_label)
+            badge = StatusBadge(status)
+            badge.setFixedHeight(28)
+            self.table.setCellWidget(row, 3, badge)
 
             # Action buttons
             action_widget = QWidget()
@@ -220,7 +221,20 @@ class TaskListPage(QWidget):
         self.select_all_cb.setChecked(False)
         self.select_all_cb.blockSignals(False)
 
+    def _on_image_loaded(self, index: int, path: str, pixmap):
+        """异步图片加载完成回调"""
+        if 0 <= index < self.table.rowCount():
+            img_label = self.table.cellWidget(index, 2)
+            if isinstance(img_label, QLabel):
+                scaled = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                img_label.setPixmap(scaled)
+
     def _on_collect(self):
+        # 进程互斥检查
+        if self._collect_process_started:
+            InfoBar.warning("提示", "采集进程已在运行中，请等待完成", parent=self)
+            return
+
         project_dir = Path(__file__).resolve().parents[3]
         try:
             cmd = [
@@ -233,9 +247,11 @@ class TaskListPage(QWidget):
                 str(self._images_per_product()),
             ]
             self._collect_process = subprocess.Popen(cmd, cwd=str(project_dir))
+            self._collect_process_started = True
             self._poll_timer.start(3000)  # Check every 3s
             InfoBar.success("启动成功", f"浏览器已打开千帆后台，每个商品最多采集 {self._images_per_product()} 张图", parent=self)
         except Exception as e:
+            self._collect_process_started = False
             InfoBar.error("启动失败", str(e), parent=self)
 
     def _check_collect_done(self):
@@ -243,6 +259,7 @@ class TaskListPage(QWidget):
         if self._collect_process and self._collect_process.poll() is not None:
             self._poll_timer.stop()
             self._collect_process = None
+            self._collect_process_started = False
             logger.info("Collection finished, loading products...")
             self.collect_done.emit()
 
@@ -268,10 +285,23 @@ class TaskListPage(QWidget):
 
     def _on_batch_delete(self):
         indices = self._get_selected()
-        if indices:
-            for i in sorted(indices, reverse=True):
-                self._products.pop(i)
-            self.load_products(self._products)
+        if not indices:
+            return
+
+        count = len(indices)
+        result = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除选中的 {count} 个产品吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+
+        for i in sorted(indices, reverse=True):
+            self._products.pop(i)
+        self.load_products(self._products)
 
     def _on_generate_single(self, row):
         if 0 <= row < len(self._products):

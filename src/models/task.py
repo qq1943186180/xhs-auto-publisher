@@ -5,11 +5,11 @@ from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 
-from src.database.db_manager import Base
+from src.database.base import Base
 
 
 class Task(Base):
-    """发布任务表"""
+    """发布任务"""
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -29,7 +29,7 @@ class Task(Base):
 
     # 关系
     product = relationship("Product", back_populates="tasks")
-    publish_history = relationship("PublishHistory", back_populates="task", cascade="all, delete-orphan")
+    publish_history = relationship("PublishHistory", back_populates="task", cascade="save-update, merge")
 
     def __repr__(self):
         return f"<Task(id={self.id}, type='{self.task_type}', status='{self.status}')>"

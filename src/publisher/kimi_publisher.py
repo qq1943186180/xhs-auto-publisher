@@ -2,7 +2,6 @@
 小红书发布器 - Kimi WebBridge 浏览器自动化
 """
 import json
-import os
 import time
 import logging
 import requests
@@ -22,7 +21,7 @@ def kimi(action: str, args: dict = None, timeout: int = 30) -> dict:
         resp = requests.post(KIMI_API, json=payload, timeout=timeout)
         return resp.json()
     except Exception as e:
-        logger.error(f"Kimi error: {e}")
+        logger.error("Kimi error: %s", e)
         return {"ok": False, "error": {"message": str(e)}}
 
 
@@ -40,7 +39,7 @@ def js_eval(code: str, timeout: int = 15):
     r = kimi("evaluate", {"code": code}, timeout=timeout)
     if _ok(r):
         return _val(r)
-    logger.warning(f"JS eval failed: {r}")
+    logger.warning("JS eval failed: %s", r)
     return None
 
 
@@ -77,7 +76,7 @@ def check_kimi_health() -> bool:
         resp = requests.get("http://127.0.0.1:10086/status", timeout=5)
         data = resp.json()
         return data.get("running") and data.get("extension_connected")
-    except:
+    except Exception:
         return False
 
 
@@ -104,7 +103,7 @@ class PublishResult:
 
 def publish_note(note: PublishNote) -> PublishResult:
     """Publish a note to XHS via Kimi WebBridge"""
-    logger.info(f"开始发布: {note.title[:30]}")
+    logger.info("开始发布: %s", note.title)
 
     # 1. Navigate
     if not navigate(XHS_PUBLISH_URL):
@@ -118,7 +117,7 @@ def publish_note(note: PublishNote) -> PublishResult:
 
     # 3. Upload images
     if note.images:
-        logger.info(f"上传 {len(note.images)} 张图片...")
+        logger.info("上传 %s 张图片...", len(note.images))
         ok = upload('input[type="file"]', note.images)
         if not ok:
             return PublishResult(False, note.title, "图片上传失败")
@@ -134,7 +133,7 @@ def publish_note(note: PublishNote) -> PublishResult:
         return r.join(', ');
     })()
     """)
-    logger.info(f"Page state after upload: {page_state}")
+    logger.info("Page state after upload: %s", page_state)
 
     # 5. Fill title
     logger.info("填写标题...")
@@ -148,7 +147,7 @@ def publish_note(note: PublishNote) -> PublishResult:
     for sel in title_selectors:
         if fill(sel, note.title):
             title_ok = True
-            logger.info(f"标题已填 ({sel})")
+            logger.info("标题已填 (%s)", sel)
             break
 
     if not title_ok:
@@ -165,7 +164,7 @@ def publish_note(note: PublishNote) -> PublishResult:
             return 'not found';
         })()
         """)
-        logger.info(f"Title via JS: {title_result}")
+        logger.info("Title via JS: %s", title_result)
 
     time.sleep(1)
 
@@ -184,7 +183,7 @@ def publish_note(note: PublishNote) -> PublishResult:
     for sel in content_selectors:
         if fill(sel, content_text):
             content_ok = True
-            logger.info(f"正文已填 ({sel})")
+            logger.info("正文已填 (%s)", sel)
             break
 
     if not content_ok:
@@ -204,7 +203,7 @@ def publish_note(note: PublishNote) -> PublishResult:
             return 'not found: ' + els.length;
         })()
         """)
-        logger.info(f"Content via JS: {content_result}")
+        logger.info("Content via JS: %s", content_result)
 
     time.sleep(2)
 

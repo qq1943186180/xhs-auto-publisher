@@ -6,25 +6,39 @@
 """
 
 import random
-import json
-from typing import Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+import time
+import asyncio
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, asdict
 
 
 # ── 常量池 ──────────────────────────────────────────────────────────────────
 
 USER_AGENTS = [
-    # Chrome Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Chrome Windows (128-135+)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
     # Chrome Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
     # Edge Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+    # Edge Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    # Chrome Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 ]
 
 SCREEN_RESOLUTIONS = [
@@ -88,6 +102,58 @@ class BrowserFingerprint:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# ── 令牌桶限流器 ────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    """
+    令牌桶限流器
+
+    支持突发流量，令牌按固定速率填充，每次 acquire() 消耗一个令牌。
+    无令牌时阻塞等待。
+
+    用法:
+        limiter = RateLimiter(rate=1.0, burst=5)  # 每秒 1 个令牌，最多攒 5 个
+        await limiter.acquire()  # 阻塞直到有令牌
+    """
+
+    def __init__(self, rate: float = 1.0, burst: int = 5):
+        """
+        Args:
+            rate: 每秒产生的令牌数
+            burst: 令牌桶最大容量
+        """
+        self.rate = rate
+        self.burst = burst
+        self._tokens = float(burst)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        """根据时间差补充令牌"""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self.burst, self._tokens + elapsed * self.rate)
+        self._last_refill = now
+
+    async def acquire(self) -> None:
+        """获取一个令牌，无令牌时阻塞等待"""
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # 计算需要等待的时间
+                wait_time = (1.0 - self._tokens) / self.rate
+            await asyncio.sleep(wait_time)
+
+    @property
+    def available(self) -> float:
+        """当前可用令牌数（近似值）"""
+        self._refill()
+        return self._tokens
 
 
 # ── 核心类 ──────────────────────────────────────────────────────────────────
@@ -243,6 +309,34 @@ class AntiDetect:
     Element.prototype.attachShadow = function() {{
         return origAttachShadow.apply(this, arguments);
     }};
+
+    // 10. 伪造 navigator.connection（网络信息 API）
+    if (!navigator.connection) {{
+        const fakeConn = {{
+            effectiveType: '4g',
+            rtt: 50,
+            downlink: 10.0,
+            saveData: false,
+            type: 'wifi',
+            downlinkMax: Infinity,
+            onchange: null,
+            addEventListener: function() {{}},
+            removeEventListener: function() {{}},
+            dispatchEvent: function() {{ return true; }},
+        }};
+        Object.defineProperty(navigator, 'connection', {{
+            get: () => fakeConn
+        }});
+    }} else {{
+        // 如果已有 connection 对象，补充缺失属性
+        try {{
+            const conn = navigator.connection;
+            if (conn.effectiveType === undefined) conn.effectiveType = '4g';
+            if (conn.rtt === undefined) conn.rtt = 50;
+            if (conn.downlink === undefined) conn.downlink = 10.0;
+            if (conn.saveData === undefined) conn.saveData = false;
+        }} catch(e) {{}}
+    }}
 }})();
 """
 
@@ -251,7 +345,6 @@ class AntiDetect:
     @classmethod
     async def human_like_delay(cls, min_sec: float = 0.8, max_sec: float = 3.0):
         """异步等待一段人类般的随机间隔"""
-        import asyncio
         delay = cls.random_delay(min_sec, max_sec)
         await asyncio.sleep(delay)
 
@@ -260,10 +353,9 @@ class AntiDetect:
     @staticmethod
     async def human_mouse_move(page, target_x: int, target_y: int, steps: int = 10):
         """模拟人类式鼠标移动轨迹（贝塞尔曲线近似）"""
-        import asyncio
-
-        # 获取当前鼠标位置（默认 0,0）
-        start_x, start_y = 0, 0
+        # 起点随机化：从页面随机位置出发，不要从 0,0 出发
+        start_x = random.randint(100, 800)
+        start_y = random.randint(100, 500)
 
         for i in range(1, steps + 1):
             t = i / steps
@@ -278,9 +370,16 @@ class AntiDetect:
 
     @staticmethod
     async def human_type(page, selector: str, text: str):
-        """模拟人类打字速度"""
-        import asyncio
+        """模拟人类打字速度，包含随机长停顿模拟思考"""
         await page.click(selector)
-        for char in text:
+        i = 0
+        while i < len(text):
+            char = text[i]
             await page.keyboard.type(char)
-            await asyncio.sleep(random.uniform(0.05, 0.15))
+            # 随机长停顿：约 15% 概率触发 0.5-2s 停顿（模拟思考）
+            if random.random() < 0.15:
+                pause = random.uniform(0.5, 2.0)
+                await asyncio.sleep(pause)
+            else:
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+            i += 1

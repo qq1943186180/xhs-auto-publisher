@@ -4,11 +4,11 @@
 - 不同级别不同颜色
 - 日志轮转
 """
-import os
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from src.paths import DATA_DIR
 
 
 # ANSI 颜色码
@@ -94,7 +94,7 @@ def setup_logger(
 
     # 文件输出
     if log_dir is None:
-        log_dir = Path.home() / ".xhs-auto-publisher" / "logs"
+        log_dir = DATA_DIR / "logs"
     
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +111,7 @@ def setup_logger(
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
-    logger.info(f"日志系统初始化完成 | 级别: {level} | 文件: {log_file}")
+    logger.info("日志系统初始化完成 | 级别: %s | 文件: %s", level, log_file)
     return logger
 
 

@@ -5,7 +5,7 @@ from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 
-from src.database.db_manager import Base
+from src.database.base import Base
 
 
 class PublishHistory(Base):

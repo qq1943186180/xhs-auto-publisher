@@ -10,7 +10,7 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 
 from qfluentwidgets import FluentWindow, FluentIcon, InfoBar
@@ -21,346 +21,20 @@ from .pages.publish_page import PublishPage
 from .pages.settings_page import SettingsPage
 from .widgets.log_console import LogConsole
 from .styles.theme import APP_BACKGROUND, BORDER, SURFACE, setup_theme
+from .utils import PAGE_MARGINS
+
+from src.services.ai_backend import (
+    AIBackend,
+    COLLECTED_DIR,
+    PRODUCTS_JSON,
+    CONFIG_JSON,
+    GENERATED_IMAGES_DIR,
+    COLLECTED_IMAGES_PER_PRODUCT,
+    _images_per_product_config,
+    _new_image_output_dir,
+)
 
 logger = logging.getLogger(__name__)
-
-COLLECTED_DIR = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "collected")
-PRODUCTS_JSON = os.path.join(COLLECTED_DIR, "products_simple.json")
-CONFIG_JSON = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "config.json")
-GENERATED_IMAGES_DIR = Path.home() / ".xhs-publisher" / "generated_images"
-COLLECTED_IMAGES_PER_PRODUCT = 5
-
-
-def _safe_dir_name(text: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text or "product").strip(" ._")
-    return name[:48] or "product"
-
-
-def _new_image_output_dir(product_name: str) -> str:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = GENERATED_IMAGES_DIR / f"{stamp}_{_safe_dir_name(product_name)}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return str(output_dir)
-
-
-def _reuse_or_create_image_output_dir(product_name: str, existing_images: list[str]) -> str:
-    for image in existing_images or []:
-        if image and os.path.exists(image):
-            parent = Path(image).parent
-            parent.mkdir(parents=True, exist_ok=True)
-            return str(parent)
-    return _new_image_output_dir(product_name)
-
-
-def _images_per_product_config() -> int:
-    try:
-        if os.path.exists(CONFIG_JSON):
-            with open(CONFIG_JSON, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            value = int(config.get("images_per_product", COLLECTED_IMAGES_PER_PRODUCT))
-            return max(1, min(9, value))
-    except Exception as e:
-        logger.warning(f"Load images_per_product config failed: {e}")
-    return COLLECTED_IMAGES_PER_PRODUCT
-
-
-class AIBackend(QObject):
-    """AI generation backend - 两轮生成：方向 → 文案"""
-    finished = pyqtSignal(dict)
-    direction_done = pyqtSignal(dict)  # 第一轮完成信号
-    image_retry_done = pyqtSignal(dict)
-    note_image_done = pyqtSignal(dict)
-
-    def generate(self, product, style="种草"):
-        def _run():
-            try:
-                from src.ai.api_key_manager import get_key_manager
-                km = get_key_manager()
-
-                product_name = product.get("title", "")
-                desc = product_name
-                local_imgs = product.get("local_images", [])
-
-                errors = []
-                has_llm_key = km.has_keys()
-
-                # ========================================
-                # 第一轮：方向生成
-                # ========================================
-                logger.info("第一轮：生成内容方向...")
-                directions_data = []
-                if has_llm_key:
-                    try:
-                        from src.ai.direction_generator import generate_directions
-                        dir_result = generate_directions(
-                            product_name=product_name,
-                            description=desc,
-                            style=style,
-                        )
-                        directions_data = [
-                            {
-                                "id": d.id,
-                                "name": d.name,
-                                "target_audience": d.target_audience,
-                                "angle": d.angle,
-                                "hook_type": d.hook_type,
-                                "style_hint": d.style_hint,
-                            }
-                            for d in dir_result.directions
-                        ]
-                        logger.info(f"方向生成完成: {[d['name'] for d in directions_data]}")
-                    except Exception as e:
-                        errors.append(f"方向生成失败: {e}")
-                        logger.warning(f"Direction generation failed: {e}")
-
-                if not directions_data:
-                    # 兜底方向
-                    from src.ai.direction_generator import _FALLBACK_DIRECTIONS
-                    directions_data = list(_FALLBACK_DIRECTIONS)
-
-                # 通知 UI 第一轮完成
-                self.direction_done.emit({"directions": directions_data})
-
-                # ========================================
-                # 第二轮：每个方向生成 3 篇文案
-                # ========================================
-                all_posts = []
-                for dir_data in directions_data:
-                    dir_name = dir_data["name"]
-                    logger.info(f"第二轮：方向「{dir_name}」生成 3 篇文案...")
-
-                    if has_llm_key:
-                        try:
-                            from src.ai.content_generator import generate_direction_content
-                            dir_content = generate_direction_content(
-                                product_name=product_name,
-                                description=desc,
-                                price="未知",
-                                selling_points="",
-                                direction=dir_data,
-                                style=style,
-                            )
-                            for post in dir_content.posts:
-                                all_posts.append({
-                                    "direction_id": dir_data["id"],
-                                    "direction_name": dir_name,
-                                    "hook_style": post.hook_style,
-                                    "title": post.title,
-                                    "content": post.content,
-                                    "tags": " ".join(post.tags) if post.tags else "",
-                                })
-                        except Exception as e:
-                            errors.append(f"方向「{dir_name}」文案生成失败: {e}")
-                            logger.warning(f"Content gen for direction {dir_name} failed: {e}")
-
-                    # 如果该方向没有生成任何帖子，用模板兜底
-                    dir_posts = [p for p in all_posts if p["direction_id"] == dir_data["id"]]
-                    if not dir_posts:
-                        from src.ai.content_generator import _generate_template_posts
-                        template_posts = _generate_template_posts(
-                            product_name,
-                            desc,
-                            dir_data,
-                            style=style,
-                        )
-                        for tp in template_posts:
-                            all_posts.append({
-                                "direction_id": dir_data["id"],
-                                "direction_name": dir_name,
-                                "hook_style": tp.hook_style,
-                                "title": tp.title,
-                                "content": tp.content,
-                                "tags": " ".join(tp.tags) if tp.tags else "",
-                            })
-
-                # 取第一篇的标题作为默认展示
-                best_title = all_posts[0]["title"] if all_posts else product_name
-
-                # 生成图片（3 张）
-                images = []
-                image_results = []
-                from src.ai.image_generator import check_kimi_health
-                if not check_kimi_health():
-                    errors.append("Kimi WebBridge 不可用，请确保浏览器扩展已连接")
-                else:
-                    try:
-                        from src.ai.image_generator import generate_images
-                        output_dir = _new_image_output_dir(product_name)
-                        product_img = None
-                        if local_imgs and os.path.exists(local_imgs[0]):
-                            product_img = local_imgs[0]
-                        img_result = generate_images(
-                            product_name=product_name,
-                            output_dir=output_dir,
-                            product_image_path=product_img,
-                            count=3,
-                        )
-                        images = img_result.images
-                        image_results = img_result.results
-                        if not images:
-                            errors.append("图片生成失败，请检查 ChatGPT 登录状态")
-                        elif len(images) < 3:
-                            errors.append(f"图片生成不完整：已生成 {len(images)}/3 张，可点击缺失图片重试")
-                    except Exception as e:
-                        errors.append(f"图片生成失败: {e}")
-                        logger.warning(f"Image generation failed: {e}")
-                        image_results = []
-
-                result = {
-                    "title": best_title,
-                    "content": all_posts[0]["content"] if all_posts else "",
-                    "tags": all_posts[0]["tags"] if all_posts else "",
-                    "images": images,
-                    "image_results": image_results,
-                    "product_name": product_name,
-                    "posts": all_posts,       # 全部 9 篇
-                    "directions": directions_data,
-                }
-                if errors:
-                    result["warnings"] = errors
-
-                self.finished.emit(result)
-            except Exception as e:
-                logger.error(f"AI generation failed: {e}")
-                self.finished.emit({
-                    "title": f"[Error] {e}",
-                    "content": "",
-                    "tags": "",
-                    "images": [],
-                    "product_name": product.get("title", ""),
-                    "posts": [],
-                    "directions": [],
-                    "errors": [str(e)],
-                })
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def retry_images(self, product, style_indices: list[int], existing_images: list[str]):
-        def _run():
-            product_name = product.get("title", "")
-            local_imgs = product.get("local_images", [])
-            errors = []
-            image_results = []
-            images = []
-            try:
-                from src.ai.image_generator import check_kimi_health, generate_images
-                if not check_kimi_health():
-                    errors.append("Kimi WebBridge 不可用，请确保浏览器扩展已连接")
-                else:
-                    product_img = None
-                    if local_imgs and os.path.exists(local_imgs[0]):
-                        product_img = local_imgs[0]
-                    output_dir = _reuse_or_create_image_output_dir(product_name, existing_images)
-                    img_result = generate_images(
-                        product_name=product_name,
-                        output_dir=output_dir,
-                        product_image_path=product_img,
-                        count=3,
-                        style_indices=style_indices,
-                    )
-                    images = img_result.images
-                    image_results = img_result.results
-                    if not images:
-                        errors.append("缺失图片重试失败，请检查 ChatGPT 登录状态")
-            except Exception as e:
-                errors.append(f"缺失图片重试失败: {e}")
-                logger.warning(f"Image retry failed: {e}")
-
-            seen = {
-                item.get("index")
-                for item in image_results
-                if isinstance(item, dict)
-            }
-            for index in style_indices:
-                if index not in seen:
-                    image_results.append({
-                        "index": index,
-                        "status": "failed",
-                        "path": "",
-                        "error": "；".join(errors) if errors else "生成失败或超时，请重试",
-                    })
-
-            self.image_retry_done.emit({
-                "images": images,
-                "image_results": image_results,
-                "warnings": errors,
-            })
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def generate_note_images(self, item: dict, product: dict | None = None):
-        def _run():
-            note_id = item.get("id")
-            product_name = (
-                (product or {}).get("title")
-                or item.get("product_name")
-                or item.get("title")
-                or "商品"
-            )
-            existing_images = [
-                path for path in item.get("images", [])
-                if path and os.path.exists(path)
-            ]
-            errors = []
-            image_results = []
-            images = []
-
-            try:
-                from src.ai.image_generator import check_kimi_health, generate_images
-                if not check_kimi_health():
-                    errors.append("Kimi WebBridge 不可用，请确保浏览器扩展已连接")
-                else:
-                    local_imgs = (product or {}).get("local_images", [])
-                    product_img = None
-                    if local_imgs and os.path.exists(local_imgs[0]):
-                        product_img = local_imgs[0]
-                    elif existing_images:
-                        product_img = existing_images[0]
-                    else:
-                        errors.append("未找到采集产品图，将使用文字提示词直接生图")
-
-                    base_prompt = item.get("image_prompt") or (
-                        f"请为 {product_name} 生成适合小红书种草笔记的真实商品图片。"
-                    )
-                    prompt_overrides = [
-                        base_prompt + "\n风格补充：博主真实分享图，日常手持或桌面场景，温柔自然光，真实随拍质感。",
-                        base_prompt + "\n风格补充：纯白简约商品图，干净背景，主体清晰，适合做首图，少道具。",
-                        base_prompt + "\n风格补充：生活氛围场景图，有真实使用环境和高级感，但商品仍是视觉主体。",
-                    ]
-
-                    if len(existing_images) < 3:
-                        style_indices = list(range(len(existing_images), 3))
-                    else:
-                        style_indices = [0, 1, 2]
-
-                    output_dir = _new_image_output_dir(product_name)
-                    img_result = generate_images(
-                        product_name=product_name,
-                        output_dir=output_dir,
-                        product_image_path=product_img,
-                        count=3,
-                        style_indices=style_indices,
-                        prompt_overrides=prompt_overrides,
-                    )
-                    images = img_result.images
-                    image_results = img_result.results
-                    if not images:
-                        errors.append("直接生成图片失败，请检查 ChatGPT 登录状态")
-            except Exception as e:
-                errors.append(f"直接生成图片失败: {e}")
-                logger.warning(f"Note image generation failed: {e}")
-
-            all_images = existing_images + images
-            self.note_image_done.emit({
-                "note_id": note_id,
-                "product_name": product_name,
-                "images": images,
-                "all_images": all_images,
-                "image_results": image_results,
-                "warnings": errors,
-            })
-
-        threading.Thread(target=_run, daemon=True).start()
 
 
 class MainWindow(FluentWindow):
@@ -397,7 +71,7 @@ class MainWindow(FluentWindow):
         ):
             page.setStyleSheet(f"QWidget#{page.objectName()} {{ background: {APP_BACKGROUND}; }}")
 
-        # AI backend
+        # AI backend (service layer)
         self.ai_backend = AIBackend()
         self.ai_backend.finished.connect(self._on_ai_done)
         self.ai_backend.image_retry_done.connect(self._on_image_retry_done)
@@ -464,14 +138,14 @@ class MainWindow(FluentWindow):
                 if not km.has_keys():
                     warnings.append("LLM Key 未配置（标题/文案将使用模板）")
             except Exception as e:
-                logger.warning(f"API key check failed: {e}")
+                logger.warning("API key check failed: %s", e)
 
             try:
                 from src.ai.image_generator import check_kimi_health
                 if not check_kimi_health():
                     warnings.append("Kimi WebBridge 未连接（无法生图，需启动浏览器扩展）")
             except Exception as e:
-                logger.warning(f"Kimi health check failed: {e}")
+                logger.warning("Kimi health check failed: %s", e)
                 warnings.append("Kimi WebBridge 检查失败（无法确认生图能力）")
 
             self.api_check_done.emit(warnings)
@@ -505,9 +179,9 @@ class MainWindow(FluentWindow):
                     "status": "pending",
                 })
             self.task_list_page.load_products(products)
-            logger.info(f"Loaded {len(products)} products")
+            logger.info("Loaded %s products", len(products))
         except Exception as e:
-            logger.error(f"Failed to load products: {e}")
+            logger.error("Failed to load products: %s", e)
 
     def _load_saved_notes(self):
         """Load saved generated notes into publish page"""
@@ -538,9 +212,9 @@ class MainWindow(FluentWindow):
                     "selected_variant_index": n.get("selected_variant_index", 0),
                 })
             self.publish_page.load_items(items)
-            logger.info(f"Loaded {len(notes)} saved notes")
+            logger.info("Loaded %s saved notes", len(notes))
         except Exception as e:
-            logger.error(f"Failed to load saved notes: {e}")
+            logger.error("Failed to load saved notes: %s", e)
 
     def _find_collected_product_for_note(self, item: dict) -> dict | None:
         """Find a collected product that can provide the real product image."""
@@ -550,7 +224,7 @@ class MainWindow(FluentWindow):
             with open(PRODUCTS_JSON, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            logger.warning(f"Load collected products for note image failed: {e}")
+            logger.warning("Load collected products for note image failed: %s", e)
             return None
 
         target = (item.get("product_name") or item.get("title") or "").strip()
@@ -666,15 +340,15 @@ class MainWindow(FluentWindow):
                 note_ids.append(note.get("id"))
             self.ai_generate_page.set_saved_note_ids(note_ids)
             if note_ids:
-                logger.info(f"Saved 1 draft note for {product_name}; {len(posts)} versions kept in AI page")
+                logger.info("Saved 1 draft note for %s; %s versions kept in AI page", product_name, len(posts))
         except Exception as e:
-            logger.error(f"Save note failed: {e}")
+            logger.error("Save note failed: %s", e)
 
         # Reload publish page
         self._load_saved_notes()
 
     def _on_retry_images_requested(self, indices):
-        product = self.ai_generate_page._product
+        product = self.ai_generate_page.get_product()
         if not product:
             InfoBar.warning("提示", "请先选择产品", parent=self.ai_generate_page)
             return
@@ -705,7 +379,7 @@ class MainWindow(FluentWindow):
             for note_id in self.ai_generate_page.get_saved_note_ids():
                 update_note_images(note_id, images)
         except Exception as e:
-            logger.error(f"Update note images failed: {e}")
+            logger.error("Update note images failed: %s", e)
 
         self._load_saved_notes()
         if warnings:
@@ -723,9 +397,9 @@ class MainWindow(FluentWindow):
 
         product = self._find_collected_product_for_note(item)
         if product:
-            logger.info(f"Found product image for note id={note_id}: {product.get('title', '')[:30]}")
+            logger.info("Found product image for note id=%s: %s", note_id, product.get('title', '')[:30])
         else:
-            logger.info(f"No collected product matched for note id={note_id}, using prompt-only image generation")
+            logger.info("No collected product matched for note id=%s, using prompt-only image generation", note_id)
 
         InfoBar.info(
             "直接生成图片",
@@ -746,7 +420,7 @@ class MainWindow(FluentWindow):
                 from src.database.generated_store import update_note_images
                 update_note_images(note_id, all_images)
             except Exception as e:
-                logger.error(f"Update note direct images failed: {e}")
+                logger.error("Update note direct images failed: %s", e)
                 InfoBar.error("保存失败", str(e), parent=self.publish_page)
                 return
 
@@ -798,7 +472,7 @@ class MainWindow(FluentWindow):
                     variants=data.get("variants"),
                     selected_variant_index=data.get("selected_variant_index"),
                 )
-                logger.info(f"Updated draft note id={note_id}")
+                logger.info("Updated draft note id=%s", note_id)
             else:
                 note = save_note(
                     title=title,
@@ -813,10 +487,10 @@ class MainWindow(FluentWindow):
                     selected_variant_index=data.get("selected_variant_index", 0),
                 )
                 self.ai_generate_page.set_saved_note_ids([note.get("id")])
-                logger.info(f"Saved current draft note id={note.get('id')}")
+                logger.info("Saved current draft note id=%s", note.get('id'))
             self._load_saved_notes()
         except Exception as e:
-            logger.error(f"Save current draft failed: {e}")
+            logger.error("Save current draft failed: %s", e)
             InfoBar.error("保存失败", str(e), parent=self.ai_generate_page)
 
     def _on_publish(self, data):
@@ -850,7 +524,7 @@ class MainWindow(FluentWindow):
                     variants=data.get("variants"),
                     selected_variant_index=data.get("selected_variant_index"),
                 )
-                logger.info(f"Updated current note id={note_id} to pending")
+                logger.info("Updated current note id=%s to pending", note_id)
             else:
                 existing_notes = get_all_notes()
                 matched = None
@@ -867,7 +541,7 @@ class MainWindow(FluentWindow):
                         variants=data.get("variants"),
                         selected_variant_index=data.get("selected_variant_index"),
                     )
-                    logger.info(f"Updated existing note id={matched['id']} to pending")
+                    logger.info("Updated existing note id=%s to pending", matched['id'])
                 else:
                     note = save_note(
                         title=title,
@@ -883,7 +557,7 @@ class MainWindow(FluentWindow):
                     )
                     self.ai_generate_page.set_saved_note_ids([note.get("id")])
         except Exception as e:
-            logger.error(f"Save failed: {e}")
+            logger.error("Save failed: %s", e)
 
         # Reload publish page
         self._load_saved_notes()
@@ -903,8 +577,6 @@ class MainWindow(FluentWindow):
                 import subprocess
                 from src.database.generated_store import update_note_status
 
-                cli_py = os.path.join(os.path.dirname(__file__), "..", "..", "cli.py")
-
                 for i, item in enumerate(items):
                     title = item.get("title", "")
                     content = item.get("content", "")
@@ -912,7 +584,7 @@ class MainWindow(FluentWindow):
                     images = item.get("images", [])
                     note_id = item.get("id")
 
-                    logger.info(f"发布 {i+1}/{len(items)}: {title[:30]}")
+                    logger.info("发布 %s/%s: %s", i+1, len(items), title[:30])
 
                     # Write temp files
                     tmp_dir = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "_publish_tmp")
@@ -925,11 +597,19 @@ class MainWindow(FluentWindow):
                     with open(content_file, "w", encoding="utf-8") as f:
                         f.write(content)
 
-                    # Build command
-                    cli_abs = os.path.abspath(cli_py)
-                    cmd = [sys.executable, cli_abs, "publish",
-                           "--title-file", title_file,
-                           "--content-file", content_file]
+                    # Build command through the package CLI so installed and
+                    # source checkouts behave the same.
+                    cmd = [
+                        sys.executable,
+                        "-m",
+                        "src.publisher.cli_publisher",
+                        "--title-file",
+                        title_file,
+                        "--content-file",
+                        content_file,
+                        "--auto",
+                        "--json",
+                    ]
                     valid_images = [img for img in images if os.path.exists(img)]
                     if valid_images:
                         cmd.append("--images")
@@ -950,17 +630,17 @@ class MainWindow(FluentWindow):
                         if line.startswith("{"):
                             try:
                                 parsed = json.loads(line)
-                            except:
+                            except json.JSONDecodeError:
                                 continue
 
                     if parsed and parsed.get("success"):
-                        logger.info(f"发布成功: {title[:30]}")
+                        logger.info("发布成功: %s", title[:30])
                         item["status"] = "已发布"
                         if note_id:
                             update_note_status(note_id, "published")
                     else:
                         error = (parsed or {}).get("message") or result.stderr[-200:] or "未知错误"
-                        logger.error(f"发布失败: {error}")
+                        logger.error("发布失败: %s", error)
                         item["status"] = "失败"
                         if note_id:
                             update_note_status(note_id, "failed", error=error)
@@ -970,7 +650,7 @@ class MainWindow(FluentWindow):
             except subprocess.TimeoutExpired:
                 logger.error("发布超时")
             except Exception as e:
-                logger.error(f"发布异常: {e}")
+                logger.error("发布异常: %s", e)
 
         threading.Thread(target=_publish_thread, daemon=True).start()
 

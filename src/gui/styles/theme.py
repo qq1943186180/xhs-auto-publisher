@@ -1,5 +1,6 @@
 """
 XHS Auto Publisher - Theme & Style (PyQt-Fluent-Widgets)
+Supports Light and Dark themes
 """
 from qfluentwidgets import setTheme, Theme, setThemeColor
 
@@ -26,11 +27,57 @@ INFO = "#2563eb"
 RADIUS_SM = "6px"
 RADIUS_MD = "8px"
 
+# Dark mode overrides
+_DARK_APP_BACKGROUND = "#1e1e2e"
+_DARK_SURFACE = "#282840"
+_DARK_SURFACE_ALT = "#2d2d44"
+_DARK_BORDER = "#3d3d5c"
+_DARK_TEXT_PRIMARY = "#e0e0e0"
+_DARK_TEXT_SECONDARY = "#a0a0b0"
+_DARK_TEXT_MUTED = "#6c6c80"
 
-def setup_theme():
-    """Setup light theme with XHS red accent."""
-    setTheme(Theme.LIGHT)
+
+_current_theme = "light"
+
+
+def setup_theme(theme: str = "light"):
+    """Setup theme with XHS red accent.
+
+    Args:
+        theme: "light" or "dark"
+    """
+    global _current_theme, APP_BACKGROUND, SURFACE, SURFACE_ALT, BORDER, BG_CARD
+    global TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED
+
+    _current_theme = theme.lower()
+
+    if _current_theme == "dark":
+        setTheme(Theme.DARK)
+        APP_BACKGROUND = _DARK_APP_BACKGROUND
+        SURFACE = _DARK_SURFACE
+        SURFACE_ALT = _DARK_SURFACE_ALT
+        BORDER = _DARK_BORDER
+        BG_CARD = _DARK_SURFACE_ALT
+        TEXT_PRIMARY = _DARK_TEXT_PRIMARY
+        TEXT_SECONDARY = _DARK_TEXT_SECONDARY
+        TEXT_MUTED = _DARK_TEXT_MUTED
+    else:
+        setTheme(Theme.LIGHT)
+        APP_BACKGROUND = "#f7f8fa"
+        SURFACE = "#ffffff"
+        SURFACE_ALT = "#f9fafb"
+        BORDER = "#e5e7eb"
+        BG_CARD = "#f9fafb"
+        TEXT_PRIMARY = "#111827"
+        TEXT_SECONDARY = "#4b5563"
+        TEXT_MUTED = "#8a8f98"
+
     setThemeColor(PRIMARY)
+
+
+def get_current_theme() -> str:
+    """获取当前主题名"""
+    return _current_theme
 
 
 def page_title_style() -> str:

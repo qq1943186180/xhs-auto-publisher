@@ -8,12 +8,12 @@
     async with QianfanCollector() as collector:
         # 首次使用会弹出浏览器等待扫码登录
         if not await collector.ensure_login():
-            print("登录失败")
+            logger.info("登录失败")
             return
 
         # 采集所有商品
         products = await collector.collect_all_products()
-        print(f"采集到 {len(products)} 个商品")
+        logger.info("采集到 %s 个商品", len(products))
 
         # 下载图片
         await collector.download_all_images(products)
@@ -170,16 +170,16 @@ class QianfanCollector:
         page_num = 1
 
         # 导航到商品管理页
-        logger.info(f"正在访问商品管理页: {self.GOODS_LIST_URL}")
+        logger.info("正在访问商品管理页: %s", self.GOODS_LIST_URL)
         await self._browser.goto(self.GOODS_LIST_URL)
         await AntiDetect.human_like_delay(2.0, 4.0)
 
         while True:
             if max_pages > 0 and page_num > max_pages:
-                logger.info(f"已达到最大采集页数: {max_pages}")
+                logger.info("已达到最大采集页数: %s", max_pages)
                 break
 
-            logger.info(f"正在采集第 {page_num} 页...")
+            logger.info("正在采集第 %s 页...", page_num)
             page_products = await self._collect_current_page()
 
             if not page_products:
@@ -201,7 +201,7 @@ class QianfanCollector:
             page_num += 1
             await AntiDetect.human_like_delay(1.5, 3.5)
 
-        logger.info(f"商品采集完成，共 {len(all_products)} 个商品")
+        logger.info("商品采集完成，共 %s 个商品", len(all_products))
         return all_products
 
     async def _collect_current_page(self) -> List[Product]:
@@ -228,7 +228,7 @@ class QianfanCollector:
                 if product and product.name:
                     products.append(product)
             except Exception as e:
-                logger.error(f"解析商品项出错: {e}")
+                logger.error("解析商品项出错: %s", e)
                 continue
 
         return products
@@ -251,7 +251,7 @@ class QianfanCollector:
         for selector in selectors:
             try:
                 await self.page.wait_for_selector(selector, timeout=3000)
-                logger.debug(f"商品列表已加载: {selector}")
+                logger.debug("商品列表已加载: %s", selector)
                 return
             except Exception:
                 continue
@@ -265,7 +265,7 @@ class QianfanCollector:
         # 策略1：table 行
         rows = await self.page.query_selector_all('table tbody tr')
         if rows and len(rows) > 0:
-            logger.debug(f"通过 table 行找到 {len(rows)} 个商品")
+            logger.debug("通过 table 行找到 %s 个商品", len(rows))
             return rows
 
         # 策略2：card 容器
@@ -273,7 +273,7 @@ class QianfanCollector:
             '[class*="goods-card"], [class*="product-card"], [class*="item-card"]'
         )
         if cards and len(cards) > 0:
-            logger.debug(f"通过 card 找到 {len(cards)} 个商品")
+            logger.debug("通过 card 找到 %s 个商品", len(cards))
             return cards
 
         # 策略3：通用列表项
@@ -281,7 +281,7 @@ class QianfanCollector:
             '[class*="goods-item"], [class*="product-item"], [class*="list-item"]'
         )
         if items and len(items) > 0:
-            logger.debug(f"通过 list-item 找到 {len(items)} 个商品")
+            logger.debug("通过 list-item 找到 %s 个商品", len(items))
             return items
 
         # 策略4：通过商品图片反查
@@ -296,7 +296,7 @@ class QianfanCollector:
                 if parent:
                     parent_items.add(parent)
             if parent_items:
-                logger.debug(f"通过图片反查找到 {len(parent_items)} 个商品")
+                logger.debug("通过图片反查找到 %s 个商品", len(parent_items))
                 return list(parent_items)
 
         return []
@@ -370,7 +370,7 @@ class QianfanCollector:
                     if match:
                         return match.group(1)
         except Exception:
-            pass
+            logger.debug("Caught Exception, continuing")
 
         # 从 data 属性提取
         for attr in ["data-id", "data-item-id", "data-goods-id", "data-key"]:
@@ -389,7 +389,7 @@ class QianfanCollector:
                 if val:
                     return val
         except Exception:
-            pass
+            logger.debug("Caught Exception, continuing")
 
         # 用名称哈希作为兜底 ID
         name = await self._extract_text(element, ['[class*="name"]', '[class*="title"]'])
@@ -512,7 +512,7 @@ class QianfanCollector:
                     await self._wait_for_goods_list()
                     return True
         except Exception:
-            pass
+            logger.debug("Caught Exception, continuing")
 
         return False
 
@@ -530,7 +530,7 @@ class QianfanCollector:
         # 尝试在当前列表页找到商品链接
         detail_url = await self._find_product_detail_url(product)
         if not detail_url:
-            logger.warning(f"未找到商品详情链接: {product.name}")
+            logger.warning("未找到商品详情链接: %s", product.name)
             return product
 
         try:
@@ -548,7 +548,7 @@ class QianfanCollector:
             await AntiDetect.human_like_delay(2.0, 3.0)
 
         except Exception as e:
-            logger.error(f"采集商品详情出错 [{product.name}]: {e}")
+            logger.error("采集商品详情出错 [%s]: %s", product.name, e)
 
         return product
 
@@ -612,7 +612,7 @@ class QianfanCollector:
                         sku["stock"] = stock_text.strip()
                     skus.append(sku)
         except Exception as e:
-            logger.debug(f"采集 SKU 出错: {e}")
+            logger.debug("采集 SKU 出错: %s", e)
         return skus
 
     # ── 图片下载 ────────────────────────────────────────────────────────
@@ -638,7 +638,7 @@ class QianfanCollector:
         downloaded = 0
         skipped = 0
 
-        logger.info(f"开始下载图片，共 {total} 张，已有进度 {len(self._downloaded)} 张")
+        logger.info("开始下载图片，共 %s 张，已有进度 %s 张", total, len(self._downloaded))
 
         connector = aiohttp.TCPConnector(limit=concurrency)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -671,7 +671,7 @@ class QianfanCollector:
                         downloaded += 1
                     await AntiDetect.human_like_delay(0.3, 1.0)
 
-        logger.info(f"图片下载完成：下载 {downloaded} 张，跳过 {skipped} 张")
+        logger.info("图片下载完成：下载 %s 张，跳过 %s 张", downloaded, skipped)
 
     async def _download_image(
         self,
@@ -693,12 +693,12 @@ class QianfanCollector:
                         data = await resp.read()
                         with open(local_path, "wb") as f:
                             f.write(data)
-                        logger.debug(f"已下载: {os.path.basename(local_path)} ({len(data)} bytes)")
+                        logger.debug("已下载: %s (%s bytes)", os.path.basename(local_path), len(data))
                         return True
                     else:
-                        logger.warning(f"下载失败 (HTTP {resp.status}): {url}")
+                        logger.warning("下载失败 (HTTP %s): %s", resp.status, url)
             except Exception as e:
-                logger.warning(f"下载出错 (尝试 {attempt+1}/{retries}): {e}")
+                logger.warning("下载出错 (尝试 %s/%s): %s", attempt+1, retries, e)
                 if attempt < retries - 1:
                     await asyncio.sleep(2 ** attempt)
 
@@ -734,7 +734,7 @@ class QianfanCollector:
                 with open(self._progress_file, "r") as f:
                     data = json.load(f)
                 self._downloaded = set(data.get("downloaded", []))
-                logger.debug(f"加载下载进度: {len(self._downloaded)} 条")
+                logger.debug("加载下载进度: %s 条", len(self._downloaded))
             except Exception:
                 self._downloaded = set()
 
@@ -745,7 +745,7 @@ class QianfanCollector:
             with open(self._progress_file, "w") as f:
                 json.dump({"downloaded": list(self._downloaded)}, f)
         except Exception:
-            pass
+            logger.debug("Caught Exception, continuing")
 
     # ── 数据导出 ────────────────────────────────────────────────────────
 
@@ -776,7 +776,7 @@ class QianfanCollector:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"数据已导出: {output_path}")
+        logger.info("数据已导出: %s", output_path)
         return output_path
 
     def export_simple(
@@ -815,7 +815,7 @@ class QianfanCollector:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"简化数据已导出: {output_path}")
+        logger.info("简化数据已导出: %s", output_path)
         return output_path
 
     # ── 调试辅助 ────────────────────────────────────────────────────────
@@ -827,9 +827,9 @@ class QianfanCollector:
         path = os.path.join(debug_dir, f"{name}_{int(time.time())}.png")
         try:
             await self.page.screenshot(path=path, full_page=True)
-            logger.debug(f"调试截图已保存: {path}")
+            logger.debug("调试截图已保存: %s", path)
         except Exception:
-            pass
+            logger.debug("Caught Exception, continuing")
 
     async def debug_dump_page_structure(self) -> str:
         """
@@ -904,7 +904,7 @@ async def main():
         # 调试模式：仅导出 DOM
         if args.debug_dom:
             dom = await collector.debug_dump_page_structure()
-            print(dom)
+            logger.debug("Output: %s", dom)
             return
 
         # 采集商品
@@ -918,16 +918,16 @@ async def main():
             os.makedirs(os.path.dirname(debug_path), exist_ok=True)
             with open(debug_path, "w", encoding="utf-8") as f:
                 f.write(dom)
-            logger.info(f"页面 DOM 结构已保存到: {debug_path}")
+            logger.info("页面 DOM 结构已保存到: %s", debug_path)
             return
 
-        logger.info(f"开始下载商品图片，每个商品最多 {collector.images_per_product} 张...")
+        logger.info("开始下载商品图片，每个商品最多 %s 张...", collector.images_per_product)
         await collector.download_all_images(products)
 
         # 导出简化数据（标题 + 最多 N 张本地图）
         output_path = collector.export_simple(products)
-        logger.info(f"采集完成！数据文件: {output_path}")
-        logger.info(f"图片目录: {os.path.join(collector.output_dir, 'images')}")
+        logger.info("采集完成！数据文件: %s", output_path)
+        logger.info("图片目录: %s", os.path.join(collector.output_dir, 'images'))
 
 
 if __name__ == "__main__":
