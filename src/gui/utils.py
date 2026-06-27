@@ -21,9 +21,11 @@ def status_label(status: str) -> str:
         "published": "已发布",
         "failed": "失败",
         "draft": "草稿",
+        "draft_saved": "已存草稿",
         "待发布": "待发布",
         "草稿": "草稿",
         "已发布": "已发布",
+        "已存草稿": "已存草稿",
         "发布失败": "发布失败",
     }
     return mapping.get(status, status)

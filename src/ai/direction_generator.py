@@ -9,8 +9,9 @@ from typing import Optional
 
 from .prompt_templates import get_direction_prompt
 from .llm_client import call_llm, extract_json
+from src.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("direction_generator")
 
 
 @dataclass
@@ -112,10 +113,10 @@ def _parse_directions(data: dict) -> list[Direction]:
         directions.append(Direction(
             id=dir_id,
             name=name,
-            target_audience=d.get("target_audience", "").strip(),
-            angle=d.get("angle", "").strip(),
-            hook_type=d.get("hook_type", "").strip(),
-            style_hint=d.get("style_hint", "").strip(),
+            target_audience=(d.get("target_audience") or "").strip(),
+            angle=(d.get("angle") or "").strip(),
+            hook_type=(d.get("hook_type") or "").strip(),
+            style_hint=(d.get("style_hint") or "").strip(),
         ))
     return directions
 
@@ -130,6 +131,7 @@ def generate_directions(
     price: str = "未知",
     selling_points: str = "",
     style: str = "种草推荐",
+    category: str = "",
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> DirectionResult:
@@ -161,7 +163,7 @@ def generate_directions(
             system_prompt, user_prompt,
             api_key=api_key,
             provider=provider,
-            temperature=0.7,  # 第一轮低温度保证方向质量
+            temperature=0.85,  # 稍高温度让方向更有差异
         )
         raw_json = extract_json(text)
         directions = _parse_directions(raw_json)
@@ -177,7 +179,7 @@ def generate_directions(
         logger.warning("方向生成 LLM 调用失败，使用兜底: %s", e)
 
     # 兜底
-    directions = _generate_fallback_directions(product_name, style)
+    directions = _generate_fallback_directions(product_name, category)
     return DirectionResult(
         directions=directions,
         raw_json={"directions": [d.__dict__ for d in directions]},

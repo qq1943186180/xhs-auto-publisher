@@ -213,7 +213,24 @@ class XhsPublisher:
 
         # ── 步骤3：切换到图文 tab ──
         logger.info("  [3/8] 切换到图文模式...")
-        await self._click_with_fallback(page, "upload_tab_image", "图文tab")
+        # 用 JS 精确点击可见的"上传图文"tab，避免选到隐藏元素
+        clicked = await page.evaluate("""
+            () => {
+                const tabs = document.querySelectorAll('.creator-tab, [role="tab"], button');
+                for (const tab of tabs) {
+                    const text = (tab.textContent || '').trim();
+                    const rect = tab.getBoundingClientRect();
+                    if (text === '上传图文' && rect.width > 0 && rect.height > 0
+                        && rect.left >= 0 && rect.top >= 0) {
+                        tab.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if not clicked:
+            await self._click_with_fallback(page, "upload_tab_image", "图文tab")
         await self.anti_detect.random_delay(1000, 2000, "切换tab后")
 
         # ── 步骤4：上传图片 ──
@@ -419,12 +436,38 @@ class XhsPublisher:
 
     async def _click_publish(self, page: Page) -> bool:
         """点击发布按钮，加强发布成功判定"""
-        publish_btn = await self._find_element(page, "publish_button", "发布按钮")
-        if not publish_btn:
-            logger.error("找不到发布按钮")
-            return False
+        # 优先用 JS 精确点击（XHS 用 div 而非 button）
+        clicked = await page.evaluate("""
+            () => {
+                const all = document.querySelectorAll('button, div, span');
+                for (const el of all) {
+                    const text = (el.textContent || '').trim();
+                    const rect = el.getBoundingClientRect();
+                    if (text === '发布' && rect.width > 20 && rect.height > 20
+                        && rect.left >= 0 && rect.top >= 0
+                        && getComputedStyle(el).display !== 'none') {
+                        el.click();
+                        return true;
+                    }
+                }
+                const btns = document.querySelectorAll('[class*="publishBtn"], [class*="btn-publish"], .btn-wrapper');
+                for (const el of btns) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 20 && rect.height > 20) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if not clicked:
+            publish_btn = await self._find_element(page, "publish_button", "发布按钮")
+            if not publish_btn:
+                logger.error("找不到发布按钮")
+                return False
+            await publish_btn.click()
 
-        await publish_btn.click()
         logger.info("  已点击发布按钮")
 
         # 等待发布结果：轮询检测 URL 变化 或 Toast 出现

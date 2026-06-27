@@ -18,6 +18,8 @@ from qfluentwidgets import (
 from src.gui.styles.theme import (
     BORDER,
     INFO,
+    PRIMARY,
+    PRIMARY_LIGHT,
     SUCCESS,
     SURFACE_ALT,
     TEXT_MUTED,
@@ -30,8 +32,9 @@ from src.gui.styles.theme import (
 from src.gui.utils import PAGE_MARGINS, status_label
 from src.gui.widgets.status_badge import StatusBadge
 from src.gui.workers.image_loader import AsyncImageLoader
+from src.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("gui.task_list_page")
 
 COLLECTED_DIR = os.path.join(os.path.expanduser("~"), ".xhs-publisher", "collected")
 PRODUCTS_JSON = os.path.join(COLLECTED_DIR, "products_simple.json")
@@ -45,6 +48,8 @@ class TaskListPage(QWidget):
     generate_requested = pyqtSignal(list)
     product_selected = pyqtSignal(dict)
     collect_done = pyqtSignal()
+    draft_edit_requested = pyqtSignal(int)
+    draft_publish_requested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -72,6 +77,27 @@ class TaskListPage(QWidget):
         subtitle.setStyleSheet(page_subtitle_style())
         title_row.addWidget(subtitle)
         layout.addLayout(title_row)
+
+        # Workflow stepper
+        self.workflow_card = CardWidget(self)
+        workflow_layout = QHBoxLayout(self.workflow_card)
+        workflow_layout.setContentsMargins(16, 12, 16, 12)
+        workflow_layout.setSpacing(10)
+        self._workflow_labels = []
+        for i, step in enumerate(("1 采集", "2 选品", "3 生成", "4 发布")):
+            label = QLabel(step)
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumWidth(92)
+            self._workflow_labels.append(label)
+            workflow_layout.addWidget(label)
+            if i < 3:
+                arrow = QLabel("→")
+                arrow.setAlignment(Qt.AlignCenter)
+                arrow.setStyleSheet(f"color: {TEXT_MUTED};")
+                workflow_layout.addWidget(arrow)
+        workflow_layout.addStretch()
+        layout.addWidget(self.workflow_card)
+        self.set_workflow_step(0)
 
         # Workbench toolbar
         toolbar_card = CardWidget(self)
@@ -113,6 +139,23 @@ class TaskListPage(QWidget):
         toolbar.addWidget(self.batch_del_btn)
         layout.addWidget(toolbar_card)
 
+        # Persistent batch status panel
+        self.queue_card = CardWidget(self)
+        queue_layout = QHBoxLayout(self.queue_card)
+        queue_layout.setContentsMargins(16, 10, 16, 10)
+        queue_layout.setSpacing(12)
+        self.queue_title_label = QLabel("批量队列")
+        self.queue_title_label.setStyleSheet(f"font-weight: 700; color: {TEXT_PRIMARY};")
+        queue_layout.addWidget(self.queue_title_label)
+        self.queue_status_label = QLabel("未开始")
+        self.queue_status_label.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        queue_layout.addWidget(self.queue_status_label, stretch=1)
+        self.queue_progress_label = QLabel("")
+        self.queue_progress_label.setStyleSheet(f"color: {TEXT_MUTED};")
+        queue_layout.addWidget(self.queue_progress_label)
+        layout.addWidget(self.queue_card)
+        self.queue_card.setVisible(False)
+
         # Table
         self.table = TableWidget(self)
         self.table.setBorderVisible(True)
@@ -142,12 +185,68 @@ class TaskListPage(QWidget):
         self.empty_widget.setVisible(True)
         self.table.setVisible(False)
 
+        # ── Draft card section ──
+        self.draft_card = CardWidget(self)
+        draft_layout = QVBoxLayout(self.draft_card)
+        draft_layout.setContentsMargins(16, 12, 16, 12)
+        draft_layout.setSpacing(8)
+
+        self.draft_count_label = QLabel("已生成草稿 (0)")
+        self.draft_count_label.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {TEXT_PRIMARY};")
+        draft_layout.addWidget(self.draft_count_label)
+
+        self.draft_table = TableWidget(self)
+        self.draft_table.setBorderVisible(True)
+        self.draft_table.setBorderRadius(8)
+        self.draft_table.setWordWrap(False)
+        self.draft_table.setColumnCount(6)
+        self.draft_table.setHorizontalHeaderLabels(["标题", "商品名称", "方向", "状态", "创建时间", "操作"])
+        self.draft_table.horizontalHeader().setStretchLastSection(True)
+        self.draft_table.verticalHeader().setDefaultSectionSize(48)
+        self.draft_table.verticalHeader().hide()
+        draft_layout.addWidget(self.draft_table)
+
+        self.draft_empty_label = QLabel("暂无草稿，生成内容后将在此展示")
+        self.draft_empty_label.setAlignment(Qt.AlignCenter)
+        self.draft_empty_label.setStyleSheet(f"color: {TEXT_MUTED}; padding: 16px;")
+        draft_layout.addWidget(self.draft_empty_label)
+
+        self.draft_card.setVisible(False)
+        layout.addWidget(self.draft_card)
+
     def _center_label(self, text, size, color=TEXT_PRIMARY, bold=False):
         label = QLabel(text)
         weight = "bold" if bold else "normal"
         label.setStyleSheet(f"font-size: {size}; color: {color}; font-weight: {weight};")
         label.setAlignment(Qt.AlignCenter)
         return label
+
+    def set_workflow_step(self, active_index: int):
+        for i, label in enumerate(getattr(self, "_workflow_labels", [])):
+            if i <= active_index:
+                label.setStyleSheet(
+                    f"background: {PRIMARY_LIGHT}; color: {PRIMARY}; "
+                    f"border: 1px solid {PRIMARY}; border-radius: 8px; padding: 7px 10px; font-weight: 700;"
+                )
+            else:
+                label.setStyleSheet(
+                    f"background: {SURFACE_ALT}; color: {TEXT_SECONDARY}; "
+                    f"border: 1px solid {BORDER}; border-radius: 8px; padding: 7px 10px;"
+                )
+
+    def set_batch_progress(self, current: int, total: int, product_name: str = "", done: bool = False):
+        self.queue_card.setVisible(total > 0)
+        if total <= 0:
+            return
+        if done:
+            self.queue_status_label.setText("批量生成已完成")
+            self.queue_progress_label.setText(f"{total}/{total}")
+            self.set_workflow_step(3)
+            return
+        name = product_name[:38] + ("…" if len(product_name) > 38 else "")
+        self.queue_status_label.setText(f"正在生成：{name}" if name else "正在生成")
+        self.queue_progress_label.setText(f"{current}/{total}")
+        self.set_workflow_step(2)
 
     def _images_per_product(self) -> int:
         try:
@@ -248,6 +347,7 @@ class TaskListPage(QWidget):
             ]
             self._collect_process = subprocess.Popen(cmd, cwd=str(project_dir))
             self._collect_process_started = True
+            self.set_workflow_step(0)
             self._poll_timer.start(3000)  # Check every 3s
             InfoBar.success("启动成功", f"浏览器已打开千帆后台，每个商品最多采集 {self._images_per_product()} 张图", parent=self)
         except Exception as e:
@@ -261,6 +361,7 @@ class TaskListPage(QWidget):
             self._collect_process = None
             self._collect_process_started = False
             logger.info("Collection finished, loading products...")
+            self.set_workflow_step(1)
             self.collect_done.emit()
 
     def _load_from_disk(self):
@@ -279,6 +380,8 @@ class TaskListPage(QWidget):
         indices = self._get_selected()
         if indices:
             products = [self._products[i] for i in indices]
+            first_name = products[0].get("title", "") if products else ""
+            self.set_batch_progress(1, len(products), first_name)
             self.generate_requested.emit(products)
         else:
             InfoBar.warning("提示", "请先选择产品", parent=self)
@@ -305,6 +408,7 @@ class TaskListPage(QWidget):
 
     def _on_generate_single(self, row):
         if 0 <= row < len(self._products):
+            self.set_batch_progress(1, 1, self._products[row].get("title", ""))
             self.generate_requested.emit([self._products[row]])
 
     def _on_view(self, row):
@@ -318,3 +422,65 @@ class TaskListPage(QWidget):
     def update_product_status(self, index: int, status: str):
         if 0 <= index < len(self._products):
             self._products[index]["status"] = status
+
+    def load_drafts(self, notes: list):
+        """Populate the draft card table from note dicts."""
+        # Filter to only draft-status notes
+        drafts = [n for n in notes if n.get("status") in ("draft", "pending", "draft_saved", "failed")]
+        self.draft_count_label.setText(f"已生成草稿 ({len(drafts)})")
+
+        if not drafts:
+            self.draft_card.setVisible(False)
+            return
+
+        self.draft_card.setVisible(True)
+        self.draft_empty_label.setVisible(False)
+        self.draft_table.setRowCount(len(drafts))
+
+        for row, note in enumerate(drafts):
+            note_id = note.get("id")
+            # Title (truncated)
+            title_text = note.get("title", "")
+            title_item = QTableWidgetItem(title_text[:40])
+            title_item.setToolTip(title_text)
+            self.draft_table.setItem(row, 0, title_item)
+
+            # Product name
+            product_text = note.get("product_name", "")
+            product_item = QTableWidgetItem(product_text[:30])
+            product_item.setToolTip(product_text)
+            self.draft_table.setItem(row, 1, product_item)
+
+            # Direction
+            dir_name = note.get("direction_name", "")
+            self.draft_table.setItem(row, 2, QTableWidgetItem(dir_name))
+
+            # Status badge
+            raw_status = note.get("status", "draft")
+            badge = StatusBadge(raw_status)
+            badge.setFixedHeight(28)
+            self.draft_table.setCellWidget(row, 3, badge)
+
+            # Created time
+            created = note.get("created_at", "")
+            if created and "T" in str(created):
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+                    created = dt.strftime("%m-%d %H:%M")
+                except Exception:
+                    created = str(created)[:10]
+            self.draft_table.setItem(row, 4, QTableWidgetItem(str(created)))
+
+            # Action buttons
+            action_widget = QWidget()
+            al = QHBoxLayout(action_widget)
+            al.setContentsMargins(4, 2, 4, 2)
+            al.setSpacing(6)
+            edit_btn = PushButton("编辑")
+            edit_btn.setFixedSize(56, 28)
+            edit_btn.setCursor(Qt.PointingHandCursor)
+            if note_id is not None:
+                edit_btn.clicked.connect(lambda _, nid=note_id: self.draft_edit_requested.emit(nid))
+            al.addWidget(edit_btn)
+            self.draft_table.setCellWidget(row, 5, action_widget)

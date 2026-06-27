@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
         "backup_count": 5,
         "console_output": True,
     },
+    "prompts": {},
 }
 
 
@@ -201,6 +202,7 @@ class ConfigManager:
             "OPENAI_API_KEY": "xhs.openai_api_key",
             "KIMI_API_KEY": "xhs.kimi_api_key",
             "QWEN_API_KEY": "xhs.qwen_api_key",
+            "NVIDIA_API_KEY": "xhs.nvidia_api_key",
         }
         for env_name, key_path in env_api_key_map.items():
             if env_name in os.environ and not self.get(key_path):

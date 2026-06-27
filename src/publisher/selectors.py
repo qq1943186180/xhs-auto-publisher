@@ -232,6 +232,9 @@ PUBLISH_BUTTON = [
     'div[class*="footer"] button:has-text("发布")',
     'button.btn-publish',
     'div[class*="action"] button:has-text("发布")',
+    'div.btn-wrapper',
+    'div.btn-inner',
+    'span.btn-text',
 ]
 
 # 发布成功标志

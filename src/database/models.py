@@ -25,6 +25,9 @@ class GeneratedNote(Base):
     selected_variant_index = Column(Integer, default=0, comment="当前选中的变体索引")
     published_at = Column(DateTime, comment="发布时间")
     error = Column(Text, comment="错误信息")
+    failure_reason = Column(Text, comment="失败原因")
+    retry_count = Column(Integer, default=0, comment="重试次数")
+    last_failed_at = Column(DateTime, comment="最后失败时间")
     created_at = Column(DateTime, default=datetime.now, comment="创建时间")
 
     def __repr__(self):
@@ -45,5 +48,8 @@ class GeneratedNote(Base):
             "selected_variant_index": self.selected_variant_index,
             "published_at": self.published_at.isoformat() if self.published_at else None,
             "error": self.error,
+            "failure_reason": self.failure_reason,
+            "retry_count": self.retry_count or 0,
+            "last_failed_at": self.last_failed_at.isoformat() if self.last_failed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

@@ -50,6 +50,7 @@ screenshot*.png
 *_scrape_results.json
 temp_*
 /_*.py
+/_*.json
 /test_*.py
 /cdp_save.py
 /dl_img.py
@@ -63,3 +64,16 @@ test_anti_ai/
 ref_xhs/
 ref_readme.md
 ui_study_*.md
+
+# Root-level screenshots and temp files
+/*.png
+/*.jpg
+/*.jpeg
+_auth.txt
+_test.sh
+fix_shortcut.vbs
+launch.vbs
+rebuild_shortcut.py
+start_app.bat
+update_shortcut_icon.bat
+/*.ps1

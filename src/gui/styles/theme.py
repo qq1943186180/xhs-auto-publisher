@@ -27,6 +27,30 @@ INFO = "#2563eb"
 RADIUS_SM = "6px"
 RADIUS_MD = "8px"
 
+# Font size constants
+FONT_SIZE_PAGE_TITLE = "24px"
+FONT_SIZE_SECTION_TITLE = "16px"
+FONT_SIZE_BODY = "14px"
+FONT_SIZE_SECONDARY = "13px"
+FONT_SIZE_CAPTION = "12px"
+FONT_SIZE_SMALL = "10px"
+
+# Spacing constants (left, top, right, bottom)
+CARD_PADDING_COMPACT = (12, 10, 12, 10)
+CARD_PADDING_DEFAULT = (16, 12, 16, 12)
+CARD_PADDING_LOOSE = (20, 20, 20, 20)
+
+# Button height constants
+BTN_HEIGHT_SM = 28
+BTN_HEIGHT_MD = 36
+BTN_HEIGHT_LG = 44
+
+# Error background
+ERROR_BG = "#fff7f8"
+
+# Text on primary color
+TEXT_ON_PRIMARY = "#ffffff"
+
 # Dark mode overrides
 _DARK_APP_BACKGROUND = "#1e1e2e"
 _DARK_SURFACE = "#282840"
@@ -35,6 +59,8 @@ _DARK_BORDER = "#3d3d5c"
 _DARK_TEXT_PRIMARY = "#e0e0e0"
 _DARK_TEXT_SECONDARY = "#a0a0b0"
 _DARK_TEXT_MUTED = "#6c6c80"
+_DARK_ERROR_BG = "#2d1f22"
+_DARK_PRIMARY_LIGHT = "#3a1520"
 
 
 _current_theme = "light"
@@ -48,6 +74,7 @@ def setup_theme(theme: str = "light"):
     """
     global _current_theme, APP_BACKGROUND, SURFACE, SURFACE_ALT, BORDER, BG_CARD
     global TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED
+    global PRIMARY, PRIMARY_HOVER, PRIMARY_LIGHT, ERROR_BG
 
     _current_theme = theme.lower()
 
@@ -61,6 +88,8 @@ def setup_theme(theme: str = "light"):
         TEXT_PRIMARY = _DARK_TEXT_PRIMARY
         TEXT_SECONDARY = _DARK_TEXT_SECONDARY
         TEXT_MUTED = _DARK_TEXT_MUTED
+        ERROR_BG = _DARK_ERROR_BG
+        PRIMARY_LIGHT = _DARK_PRIMARY_LIGHT
     else:
         setTheme(Theme.LIGHT)
         APP_BACKGROUND = "#f7f8fa"
@@ -71,6 +100,8 @@ def setup_theme(theme: str = "light"):
         TEXT_PRIMARY = "#111827"
         TEXT_SECONDARY = "#4b5563"
         TEXT_MUTED = "#8a8f98"
+        ERROR_BG = "#fff7f8"
+        PRIMARY_LIGHT = "#fff1f3"
 
     setThemeColor(PRIMARY)
 
@@ -81,15 +112,19 @@ def get_current_theme() -> str:
 
 
 def page_title_style() -> str:
-    return f"font-size: 24px; font-weight: 700; color: {TEXT_PRIMARY};"
+    return f"font-size: {FONT_SIZE_PAGE_TITLE}; font-weight: 700; color: {TEXT_PRIMARY};"
 
 
 def page_subtitle_style() -> str:
-    return f"font-size: 13px; color: {TEXT_SECONDARY};"
+    return f"font-size: {FONT_SIZE_SECONDARY}; color: {TEXT_SECONDARY};"
 
 
 def section_title_style() -> str:
-    return f"font-size: 16px; font-weight: 700; color: {TEXT_PRIMARY};"
+    return f"font-size: {FONT_SIZE_SECTION_TITLE}; font-weight: 700; color: {TEXT_PRIMARY};"
+
+
+def dialog_title_style() -> str:
+    return f"font-size: 18px; font-weight: 700; color: {TEXT_PRIMARY};"
 
 
 def muted_text_style(size: int = 13) -> str:
@@ -113,7 +148,7 @@ def placeholder_style() -> str:
             border: 1px dashed {BORDER};
             border-radius: {RADIUS_MD};
             color: {TEXT_MUTED};
-            font-size: 13px;
+            font-size: {FONT_SIZE_SECONDARY};
         }}
     """
 
@@ -138,7 +173,7 @@ def danger_button_style() -> str:
             font-weight: 600;
         }}
         QPushButton:hover {{
-            color: #ffffff;
+            color: {TEXT_ON_PRIMARY};
             background: {ERROR};
         }}
     """

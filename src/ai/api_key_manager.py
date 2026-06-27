@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
 from src.utils.secure_store import get_or_create_passphrase
+from src.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("api_key_manager")
 
 try:
     from cryptography.fernet import Fernet
@@ -31,6 +32,7 @@ class Provider(str, Enum):
     OPENAI = "openai"
     KIMI = "kimi"
     QWEN = "qwen"  # 通义千问
+    NVIDIA = "nvidia"  # NVIDIA NIM (OpenAI 兼容)
 
 
 # 提供商默认配置（配置驱动，不硬编码在 Provider 枚举里）
@@ -50,6 +52,18 @@ PROVIDER_CONFIG = {
         "model": "qwen-plus",
         "max_tokens": 2000,
     },
+    Provider.NVIDIA: {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "model": "deepseek-ai/deepseek-v4-flash",
+        "max_tokens": 4000,
+    },
+}
+
+PRIMARY_MODEL_CONFIG = {
+    "provider": Provider.OPENAI,
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "model": "mimo-v2.5",
+    "max_tokens": 4000,
 }
 
 
@@ -217,6 +231,8 @@ class APIKeyManager:
 
         self._passphrase = passphrase or _get_or_create_passphrase()
         self._load()
+        self.ensure_primary_model()
+        self._sync_env_on_startup()
 
     # ----------------------------------------------------------
     # 公开 API
@@ -234,24 +250,82 @@ class APIKeyManager:
         添加一个 API Key。如果相同 provider + api_key 已存在，跳过并返回 False。
         """
         provider = Provider(provider) if isinstance(provider, str) else provider
+        config = PROVIDER_CONFIG.get(provider, {})
+        target_base_url = base_url or config.get("base_url")
+        target_model = model or config.get("model")
 
         # 检查重复
         for existing in self._keys:
-            if existing.provider == provider and existing.api_key == api_key:
+            if (
+                existing.provider == provider
+                and existing.api_key == api_key
+                and existing.base_url == target_base_url
+                and existing.model == target_model
+            ):
                 logger.debug("API key already exists for %s, skipping", provider.value)
                 return False
 
-        config = PROVIDER_CONFIG.get(provider, {})
         entry = APIKeyEntry(
             provider=provider,
             api_key=api_key,
-            base_url=base_url or config.get("base_url"),
-            model=model or config.get("model"),
+            base_url=target_base_url,
+            model=target_model,
             max_tokens=max_tokens or config.get("max_tokens", 2000),
         )
         self._keys.append(entry)
         self._save()
         return True
+
+    def ensure_primary_model(self) -> None:
+        """Ensure the preferred Mimo model exists and is used first."""
+        config = PRIMARY_MODEL_CONFIG
+        provider = config["provider"]
+        for entry in list(self._keys):
+            if (
+                entry.provider == provider
+                and entry.base_url == config["base_url"]
+                and entry.model == config["model"]
+            ):
+                entry.enabled = True
+                entry.max_tokens = config["max_tokens"]
+                self._keys.remove(entry)
+                self._keys.insert(0, entry)
+                self._round_robin.clear()
+                self._save()
+                return
+
+    def update_key(
+        self,
+        provider: str | Provider,
+        api_key: str,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        old_base_url: Optional[str] = None,
+        old_model: Optional[str] = None,
+    ) -> bool:
+        """
+        更新已有 key 的 base_url 和 model。
+        按 provider + api_key 匹配，返回 True 表示找到并更新。
+        """
+        provider = Provider(provider) if isinstance(provider, str) else provider
+        for entry in self._keys:
+            if (
+                entry.provider == provider
+                and entry.api_key == api_key
+                and (old_base_url is None or entry.base_url == old_base_url)
+                and (old_model is None or entry.model == old_model)
+            ):
+                changed = False
+                if base_url is not None and base_url != entry.base_url:
+                    entry.base_url = base_url
+                    changed = True
+                if model is not None and model != entry.model:
+                    entry.model = model
+                    changed = True
+                if changed:
+                    self._save()
+                return True
+        return False
 
     def remove_key(self, api_key: str) -> bool:
         """移除指定的 API Key"""
@@ -260,6 +334,54 @@ class APIKeyManager:
         if len(self._keys) < before:
             self._save()
             return True
+        return False
+
+    def remove_model(
+        self,
+        provider: str | Provider,
+        api_key: str,
+        base_url: Optional[str],
+        model: Optional[str],
+    ) -> bool:
+        """Remove one saved model configuration."""
+        provider = Provider(provider) if isinstance(provider, str) else provider
+        before = len(self._keys)
+        self._keys = [
+            k for k in self._keys
+            if not (
+                k.provider == provider
+                and k.api_key == api_key
+                and k.base_url == base_url
+                and k.model == model
+            )
+        ]
+        if len(self._keys) < before:
+            self._round_robin.clear()
+            self._save()
+            return True
+        return False
+
+    def set_primary_model(
+        self,
+        provider: str | Provider,
+        api_key: str,
+        base_url: Optional[str],
+        model: Optional[str],
+    ) -> bool:
+        """Move one saved model to the front so default LLM calls use it first."""
+        provider = Provider(provider) if isinstance(provider, str) else provider
+        for entry in list(self._keys):
+            if (
+                entry.provider == provider
+                and entry.api_key == api_key
+                and entry.base_url == base_url
+                and entry.model == model
+            ):
+                self._keys.remove(entry)
+                self._keys.insert(0, entry)
+                self._round_robin.clear()
+                self._save()
+                return True
         return False
 
     def get_key(
@@ -286,6 +408,12 @@ class APIKeyManager:
                 k for k in self._keys
                 if k.enabled and k.error_count < k.max_errors
             ]
+            # 如果有首选 provider，优先只使用该 provider，避免轮询到其它旧/坏 key。
+            preferred = os.environ.get("XHS_DEFAULT_PROVIDER", "").lower()
+            if preferred:
+                preferred_candidates = [k for k in candidates if k.provider.value == preferred]
+                if preferred_candidates:
+                    candidates = preferred_candidates
 
         if not candidates:
             return None
@@ -298,12 +426,44 @@ class APIKeyManager:
         entry.last_used = time.time()
         return entry
 
+    def peek_keys(
+        self,
+        provider: Optional[str | Provider] = None,
+    ) -> list[APIKeyEntry]:
+        """Return currently usable keys without changing round-robin state."""
+        if not self._keys:
+            return []
+
+        provider_value = None
+        if provider:
+            provider = Provider(provider) if isinstance(provider, str) else provider
+            provider_value = provider.value
+
+        candidates = [
+            k for k in self._keys
+            if k.enabled
+            and k.error_count < k.max_errors
+            and (provider_value is None or k.provider.value == provider_value)
+        ]
+        if provider_value is None:
+            preferred = os.environ.get("XHS_DEFAULT_PROVIDER", "").lower()
+            if preferred:
+                preferred_candidates = [k for k in candidates if k.provider.value == preferred]
+                if preferred_candidates:
+                    candidates = preferred_candidates
+        return candidates
+
     def report_success(self, api_key: str) -> None:
         """报告调用成功，重置错误计数"""
+        changed = False
         for k in self._keys:
             if k.api_key == api_key:
-                k.error_count = 0
+                if k.error_count:
+                    k.error_count = 0
+                    changed = True
                 break
+        if changed:
+            self._save()
 
     def report_error(self, api_key: str, permanent: bool = False) -> None:
         """
@@ -325,24 +485,56 @@ class APIKeyManager:
                         k.enabled = False
                         logger.warning("API key disabled after %d errors: %s...",
                                        k.error_count, _mask_key(api_key))
+                self._save()
                 break
+
+    def reset_key_errors(self, provider: Optional[str | Provider] = None) -> int:
+        """Re-enable keys and clear transient error counters."""
+        provider_value = None
+        if provider:
+            provider = Provider(provider) if isinstance(provider, str) else provider
+            provider_value = provider.value
+
+        count = 0
+        for k in self._keys:
+            if provider_value is not None and k.provider.value != provider_value:
+                continue
+            if not k.enabled or k.error_count:
+                k.enabled = True
+                k.error_count = 0
+                count += 1
+        if count:
+            self._save()
+        return count
 
     def list_keys(self) -> list[dict]:
         """列出所有 key（脱敏）"""
         result = []
-        for k in self._keys:
+        for index, k in enumerate(self._keys):
             result.append({
+                "index": index,
                 "provider": k.provider.value,
                 "key_masked": _mask_key(k.api_key),
+                "api_key": k.api_key,
+                "base_url": k.base_url,
                 "model": k.model,
+                "max_tokens": k.max_tokens,
                 "enabled": k.enabled,
                 "error_count": k.error_count,
             })
         return result
 
+    def fetch_models(self, api_key: str, base_url: str) -> list[str]:
+        """Fetch model ids from an OpenAI-compatible API."""
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30)
+        result = client.models.list()
+        return sorted({m.id for m in result.data if getattr(m, "id", None)})
+
     def has_keys(self, provider: Optional[str | Provider] = None) -> bool:
         """是否有可用的 key"""
-        return self.get_key(provider) is not None
+        return bool(self.peek_keys(provider))
 
     # ----------------------------------------------------------
     # 环境变量批量加载
@@ -364,6 +556,7 @@ class APIKeyManager:
             (Provider.OPENAI, "XHS_OPENAI_KEY", "OPENAI_API_KEY"),
             (Provider.KIMI, "XHS_KIMI_KEY", "KIMI_API_KEY"),
             (Provider.QWEN, "XHS_QWEN_KEY", "QWEN_API_KEY"),
+            (Provider.NVIDIA, "XHS_NVIDIA_KEY", "NVIDIA_API_KEY"),
         ]
         for provider, primary, fallback in env_map:
             key = os.environ.get(primary) or os.environ.get(fallback)
@@ -426,6 +619,46 @@ class APIKeyManager:
         except Exception as e:
             logger.warning("Failed to load API keys from %s: %s (file may be corrupted or passphrase changed)",
                            self._storage_path, e)
+
+    def _sync_env_on_startup(self) -> None:
+        """启动时自动同步环境变量，确保 LLM 始终可用。"""
+        # 1. 从环境变量加载新 key（会跳过已存在的）
+        self.load_from_env()
+
+        # 2. 删除永久禁用且不在环境变量中的无效 key
+        env_keys = set()
+        for primary, fallback in [
+            ("XHS_OPENAI_KEY", "OPENAI_API_KEY"),
+            ("XHS_KIMI_KEY", "KIMI_API_KEY"),
+            ("XHS_QWEN_KEY", "QWEN_API_KEY"),
+            ("XHS_NVIDIA_KEY", "NVIDIA_API_KEY"),
+        ]:
+            key = os.environ.get(primary) or os.environ.get(fallback)
+            if key:
+                env_keys.add(key)
+
+        to_remove = []
+        for k in self._keys:
+            if not k.enabled and k.error_count >= k.max_errors:
+                if k.api_key not in env_keys:
+                    to_remove.append(k.api_key)
+        for key in to_remove:
+            self.remove_key(key)
+            logger.info("Removed permanently disabled key not in env: %s...", _mask_key(key))
+
+        # 3. 重置环境变量中 key 的错误计数（给它新的机会）
+        for k in self._keys:
+            if k.api_key in env_keys and (not k.enabled or k.error_count > 0):
+                k.enabled = True
+                k.error_count = 0
+                logger.info("Re-enabled env key for %s: %s...", k.provider.value, _mask_key(k.api_key))
+
+        # 4. 如果没有任何可用 key，强制从环境变量加载
+        if not self.has_keys():
+            logger.warning("No usable API keys found, force-loading from environment")
+            self.load_from_env()
+
+        self._save()
 
     def reencrypt(self) -> bool:
         """

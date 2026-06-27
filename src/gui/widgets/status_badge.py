@@ -19,6 +19,15 @@ class StatusBadge(QWidget):
         "published":   (SUCCESS, "已发布"),
         "failed":      (ERROR,   "失败"),
         "draft":       (TEXT_SECONDARY, "草稿"),
+        "draft_saved": (INFO,    "已存草稿"),
+        # 步骤级状态
+        "direction_generating": (INFO, "方向生成中"),
+        "content_generating":   (INFO, "文案生成中"),
+        "image_uploading":      (INFO, "图片上传中"),
+        "image_generating":     (INFO, "生图等待中"),
+        "preparing_files":      (INFO, "准备文件"),
+        "filling_form":         (INFO, "填写表单"),
+        "submitting":           (INFO, "提交中"),
     }
 
     def __init__(self, status: str = "pending", parent=None):

@@ -11,8 +11,9 @@ from typing import Optional
 from .prompt_templates import get_title_prompt
 from .llm_client import call_llm
 from .text_cleaner import soften_title
+from src.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("title_generator")
 
 try:
     from openai import OpenAI  # noqa: F401 — 保留兼容导入

@@ -50,9 +50,6 @@ _CONTENT_REPLACEMENTS = {
     "性价比超高": "价格和质感还算匹配",
     "颜值在线": "外观比较顺眼",
     "品质过硬": "做工还可以",
-    "总结一下": "",
-    "总之": "",
-    "整体来说": "",
     "评论区问我": "有问题可以问我",
     "有喜欢的姐妹": "如果你也在看这类",
     "高级感满满": "看起来比较干净",
@@ -78,25 +75,23 @@ def soften_title(title: str) -> str:
 
 
 def soften_ai_style(text: str) -> str:
-    """清洗正文中的 AI 营销味道（正文模式，保留自然表达）"""
+    """清洗正文中的 AI 营销味道（轻量模式，保留自然表达）"""
     for old, new in _CONTENT_REPLACEMENTS.items():
         text = text.replace(old, new)
     # 多个感叹号替换为句号
     text = re.sub(r"[!！]{2,}", "。", text)
     # 多个波浪号合并
     text = re.sub(r"[~～]{2,}", "～", text)
-    # 移除总结类过渡词
-    text = re.sub(r"(总结一下[:：]?|总之[:：]?|整体来说[:：]?)", "", text)
-    # 保留最多 1 个 emoji，其余移除
+    # 保留最多 2 个 emoji，其余移除
     emoji_pattern = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
     seen = 0
 
-    def keep_one(match):
+    def keep_two(match):
         nonlocal seen
         seen += 1
-        return match.group(0) if seen == 1 else ""
+        return match.group(0) if seen <= 2 else ""
 
-    text = emoji_pattern.sub(keep_one, text)
+    text = emoji_pattern.sub(keep_two, text)
     # 合并过多空行
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()

@@ -117,6 +117,9 @@ def _note_to_dict(note) -> dict:
         "created_at": note.created_at.isoformat() if note.created_at else None,
         "published_at": note.published_at.isoformat() if note.published_at else None,
         "error": note.error,
+        "failure_reason": getattr(note, "failure_reason", None),
+        "retry_count": getattr(note, "retry_count", 0) or 0,
+        "last_failed_at": note.last_failed_at.isoformat() if getattr(note, "last_failed_at", None) else None,
         "variants": note.variants or [],
         "selected_variant_index": note.selected_variant_index or 0,
     }
@@ -169,6 +172,10 @@ def update_note_status(note_id: int, status: str, error: str = None):
                 note.published_at = datetime.now()
             if error:
                 note.error = error
+            if status == "failed":
+                note.failure_reason = error or "未知错误"
+                note.last_failed_at = datetime.now()
+                note.retry_count = (note.retry_count or 0) + 1
 
 
 def update_note_images(note_id: int, images: list):
@@ -246,6 +253,37 @@ def get_pending_notes() -> list:
             GeneratedNote.status.in_(["draft", "pending"])
         ).order_by(GeneratedNote.id).all()
         return [_note_to_dict(n) for n in notes]
+
+
+def get_failed_notes() -> list:
+    """Get notes that failed to publish"""
+    from src.database.models import GeneratedNote
+
+    with _get_session() as session:
+        notes = session.query(GeneratedNote).filter(
+            GeneratedNote.status == "failed"
+        ).order_by(GeneratedNote.id).all()
+        return [_note_to_dict(n) for n in notes]
+
+
+def reset_notes_to_pending(note_ids: list) -> int:
+    """Batch reset failed notes to pending status for retry. Returns count."""
+    from src.database.models import GeneratedNote
+
+    if not note_ids:
+        return 0
+
+    with _get_session() as session:
+        count = session.query(GeneratedNote).filter(
+            GeneratedNote.id.in_(note_ids),
+            GeneratedNote.status == "failed",
+        ).update({
+            GeneratedNote.status: "pending",
+            GeneratedNote.failure_reason: None,
+            GeneratedNote.error: None,
+            GeneratedNote.last_failed_at: None,
+        }, synchronize_session="fetch")
+    return count
 
 
 def delete_note(note_id: int):

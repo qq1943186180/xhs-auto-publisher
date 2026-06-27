@@ -8,7 +8,9 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from src.utils.logger import get_logger
+
+logger = get_logger("gui.publish_page")
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -29,7 +31,7 @@ from PyQt5.QtGui import QColor, QDesktopServices, QPixmap
 
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, PushButton, TableWidget,
-    ProgressBar, CheckBox, InfoBar
+    ProgressBar, CheckBox, InfoBar, SegmentedWidget
 )
 from src.gui.styles.theme import (
     BORDER,
@@ -56,11 +58,17 @@ class PublishPage(QWidget):
     """Publish management page"""
 
     publish_requested = pyqtSignal(list)
+    draft_requested = pyqtSignal(list)
     direct_image_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._items = []
+        self._selected_ids = set()
+        self._thumb_labels = {}
+        self._card_checkboxes = {}
+        self._next_thumb_index = 1
+        self._view_mode = "card"
         self._image_loader = AsyncImageLoader(self)
         self._image_loader.image_loaded.connect(self._on_batch_image_loaded)
         self._setup_ui()
@@ -80,6 +88,29 @@ class PublishPage(QWidget):
         header.addWidget(subtitle)
         layout.addLayout(header)
 
+        self.summary_card = CardWidget(self)
+        summary_layout = QHBoxLayout(self.summary_card)
+        summary_layout.setContentsMargins(16, 12, 16, 12)
+        summary_layout.setSpacing(12)
+        self.summary_labels = {}
+        for key, label in (
+            ("pending", "待发布"),
+            ("draft_saved", "草稿箱"),
+            ("published", "已发布"),
+            ("failed", "失败"),
+        ):
+            box = QLabel(f"{label}\n0")
+            box.setAlignment(Qt.AlignCenter)
+            box.setMinimumWidth(110)
+            box.setStyleSheet(
+                f"background: {SURFACE_ALT}; border: 1px solid {BORDER}; border-radius: 8px; "
+                f"padding: 8px; color: {TEXT_PRIMARY}; font-weight: 700;"
+            )
+            summary_layout.addWidget(box)
+            self.summary_labels[key] = box
+        summary_layout.addStretch()
+        layout.addWidget(self.summary_card)
+
         # Action bar
         card = CardWidget(self)
         card_layout = QHBoxLayout(card)
@@ -90,7 +121,23 @@ class PublishPage(QWidget):
         self.count_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 14px;")
         card_layout.addWidget(self.count_label)
 
+        self.view_switch = SegmentedWidget(self)
+        self.view_switch.addItem("card", "卡片")
+        self.view_switch.addItem("table", "表格")
+        self.view_switch.setCurrentItem(self._view_mode)
+        self.view_switch.currentItemChanged.connect(self._on_view_mode_changed)
+        card_layout.addWidget(self.view_switch)
+
         card_layout.addStretch()
+
+        self.select_all_cb = CheckBox("全选")
+        self.select_all_cb.setChecked(False)
+        self.select_all_cb.stateChanged.connect(self._on_select_all)
+        card_layout.addWidget(self.select_all_cb)
+
+        self.selected_label = QLabel("已选 0 篇")
+        self.selected_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 13px;")
+        card_layout.addWidget(self.selected_label)
 
         self.refresh_btn = PushButton("刷新")
         self.refresh_btn.setFixedHeight(36)
@@ -109,6 +156,17 @@ class PublishPage(QWidget):
         self.publish_all_btn.clicked.connect(self._on_publish_all)
         card_layout.addWidget(self.publish_all_btn)
 
+        self.draft_btn = PushButton("发布到草稿箱")
+        self.draft_btn.setFixedHeight(36)
+        self.draft_btn.setMinimumWidth(130)
+        self.draft_btn.clicked.connect(self._on_publish_draft)
+        card_layout.addWidget(self.draft_btn)
+
+        self.retry_failed_btn = PushButton("重试失败项")
+        self.retry_failed_btn.setFixedHeight(36)
+        self.retry_failed_btn.clicked.connect(self._on_retry_failed)
+        card_layout.addWidget(self.retry_failed_btn)
+
         self.delete_all_btn = PushButton("全部删除")
         self.delete_all_btn.setFixedHeight(36)
         self.delete_all_btn.setMinimumWidth(100)
@@ -119,26 +177,179 @@ class PublishPage(QWidget):
         layout.addWidget(card)
 
         # Progress
+        progress_layout = QHBoxLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(8)
         self.progress_bar = ProgressBar()
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setFixedHeight(10)
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_bar, stretch=1)
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 13px;")
+        self.progress_label.setFixedWidth(140)
+        progress_layout.addWidget(self.progress_label)
+        layout.addLayout(progress_layout)
+
+        # Card grid
+        self.card_scroll = QScrollArea(self)
+        self.card_scroll.setWidgetResizable(True)
+        self.card_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.card_container = QWidget()
+        self.card_grid = QGridLayout(self.card_container)
+        self.card_grid.setContentsMargins(0, 0, 0, 0)
+        self.card_grid.setSpacing(14)
+        self.card_scroll.setWidget(self.card_container)
+        layout.addWidget(self.card_scroll)
 
         # Table
         self.table = TableWidget(self)
         self.table.setBorderVisible(True)
         self.table.setBorderRadius(8)
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["", "产品", "标题", "图片", "状态", "操作"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["", "产品", "标题", "图片", "状态", "失败原因", "操作"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 48)
         self.table.setColumnWidth(1, 130)
-        self.table.setColumnWidth(2, 180)
-        self.table.setColumnWidth(3, 130)
-        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(2, 160)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 90)
+        self.table.setColumnWidth(5, 160)
         self.table.verticalHeader().setDefaultSectionSize(52)
         self.table.verticalHeader().hide()
         layout.addWidget(self.table)
+        self._apply_view_mode()
+
+    def _on_view_mode_changed(self, key: str):
+        """SegmentedWidget 切换回调：更新视图模式并刷新显示。"""
+        self._view_mode = key
+        self._apply_view_mode()
+        # 切换到当前视图时重新加载数据
+        if self._items:
+            if key == "card":
+                self._load_cards()
+            # table 视图由 load_items → _populate 链路已处理
+
+    def _apply_view_mode(self):
+        """根据 _view_mode 切换卡片网格和表格的可见性。"""
+        if self._view_mode == "card":
+            self.card_scroll.setVisible(True)
+            self.table.setVisible(False)
+        else:
+            self.card_scroll.setVisible(False)
+            self.table.setVisible(True)
+
+    def _load_cards(self):
+        """将当前 _items 渲染到卡片网格。"""
+        # 清空旧卡片
+        while self.card_grid.count():
+            w = self.card_grid.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self._card_checkboxes.clear()
+        self._thumb_labels.clear()
+
+        for idx, item in enumerate(self._items):
+            card = CardWidget(self)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(6)
+
+            # 标题行：复选框 + 标题
+            top_row = QHBoxLayout()
+            cb = CheckBox()
+            key = self._item_key(item)
+            cb.setProperty("itemKey", key)
+            cb.setChecked(key in self._selected_ids)
+            cb.stateChanged.connect(lambda state, k=key: self._on_card_cb_toggled(state, k))
+            self._card_checkboxes[key] = cb
+            top_row.addWidget(cb)
+
+            title_label = QLabel(item.get("title", "无标题")[:24])
+            title_label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: bold;")
+            title_label.setWordWrap(True)
+            top_row.addWidget(title_label, stretch=1)
+            card_layout.addLayout(top_row)
+
+            # 产品名 + 状态
+            meta_row = QHBoxLayout()
+            product_label = QLabel(item.get("product_name", "")[:16])
+            product_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+            meta_row.addWidget(product_label)
+            meta_row.addStretch()
+            status_badge = StatusBadge(item.get("raw_status", "draft"))
+            meta_row.addWidget(status_badge)
+            card_layout.addLayout(meta_row)
+
+            # 图片缩略区
+            img_count = len(item.get("images", []))
+            img_label = QLabel(f"{img_count} 张图片" if img_count else "无图片")
+            img_label.setStyleSheet(
+                f"color: {TEXT_MUTED}; font-size: 12px; padding: 8px; "
+                f"background: {SURFACE_ALT}; border-radius: 4px;"
+            )
+            img_label.setAlignment(Qt.AlignCenter)
+            img_label.setFixedHeight(48)
+            card_layout.addWidget(img_label)
+
+            # 操作按钮行
+            btn_row = QHBoxLayout()
+            view_btn = PushButton("查看")
+            view_btn.setFixedHeight(28)
+            view_btn.clicked.connect(lambda checked, it=item: self._open_note_detail(it))
+            btn_row.addWidget(view_btn)
+
+            raw_status = item.get("raw_status", "draft")
+            if raw_status in ("draft", "pending", "failed"):
+                pub_btn = PrimaryPushButton("发布")
+                pub_btn.setFixedHeight(28)
+                pub_btn.clicked.connect(lambda checked, it=item: self.publish_requested.emit([it]))
+                btn_row.addWidget(pub_btn)
+
+            del_btn = PushButton("删除")
+            del_btn.setFixedHeight(28)
+            del_btn.setStyleSheet(danger_button_style())
+            del_btn.clicked.connect(lambda checked, k=key: self._delete_by_key(k))
+            btn_row.addWidget(del_btn)
+
+            card_layout.addLayout(btn_row)
+
+            row, col = divmod(idx, 3)
+            self.card_grid.addWidget(card, row, col)
+
+    def _on_card_cb_toggled(self, state, key: str):
+        """卡片复选框状态变化。"""
+        if state:
+            self._selected_ids.add(key)
+        else:
+            self._selected_ids.discard(key)
+        self._update_selected_label()
+
+    def _item_key(self, item: dict) -> str:
+        """Generate a stable unique key for an item."""
+        item_id = item.get("id")
+        if item_id:
+            return str(item_id)
+        return f"{item.get('title', '')}_{item.get('product_name', '')}"
+
+    def _delete_by_key(self, key: str):
+        """按 item key 删除单条笔记。"""
+        for i, item in enumerate(self._items):
+            if self._item_key(item) == key:
+                note_id = item.get("id")
+                if note_id:
+                    try:
+                        from src.database.generated_store import delete_note
+                        delete_note(note_id)
+                    except Exception as e:
+                        logger.warning("删除笔记失败: %s", e)
+                        InfoBar.error("删除失败", str(e), parent=self)
+                        return
+                self._items.pop(i)
+                self.load_items(self._items)
+                break
+
+    def _update_selected_label(self):
+        self.selected_label.setText(f"已选 {len(self._selected_ids)} 篇")
 
     def _build_item_from_note(self, n: dict) -> dict:
         """统一构建 item 数据，消除重复代码"""
@@ -157,6 +368,8 @@ class PublishPage(QWidget):
             "created_at": n.get("created_at", ""),
             "published_at": n.get("published_at", ""),
             "error": n.get("error", ""),
+            "failure_reason": n.get("failure_reason", ""),
+            "retry_count": n.get("retry_count", 0),
             "variants": n.get("variants", []),
             "selected_variant_index": n.get("selected_variant_index", 0),
         }
@@ -165,8 +378,11 @@ class PublishPage(QWidget):
         """Load items into table with diff logic: only update changed rows"""
         old_items = self._items
         self._items = items
+        live_ids = {self._item_key(item) for item in items}
+        self._selected_ids.intersection_update(live_ids)
         self.count_label.setText(f"共 {len(items)} 篇笔记")
         self.delete_all_btn.setEnabled(bool(items))
+        self._update_summary(items)
 
         # Check if structure changed (different count or different IDs)
         old_ids = [item.get("id") for item in old_items]
@@ -179,8 +395,10 @@ class PublishPage(QWidget):
         if structure_changed:
             # Full rebuild
             self._rebuild_table(items)
+            self._rebuild_cards(items)
         else:
             # Diff update: only update changed rows
+            dirty_cards = False
             for row, item in enumerate(items):
                 old_item = old_items[row] if row < len(old_items) else {}
                 # Check if item content changed
@@ -191,6 +409,12 @@ class PublishPage(QWidget):
                     or old_item.get("product_name") != item.get("product_name")
                 ):
                     self._update_table_row(row, item)
+                    dirty_cards = True
+            if dirty_cards:
+                self._rebuild_cards(items)
+            else:
+                self._sync_selection_widgets()
+        self._update_selected_count()
 
     def _rebuild_table(self, items: list):
         """Full table rebuild"""
@@ -199,11 +423,77 @@ class PublishPage(QWidget):
             self._populate_table_row(row, item)
         # Load images in background
         self._load_table_images(items)
+        self._sync_selection_widgets()
+
+    def _rebuild_cards(self, items: list):
+        """Rebuild card grid view."""
+        self._load_cards()
+
+    def _on_item_checked(self, key: str, state):
+        """Handle table row checkbox toggle."""
+        if state:
+            self._selected_ids.add(key)
+        else:
+            self._selected_ids.discard(key)
+        self._sync_selection_widgets()
+
+    def _sync_selection_widgets(self):
+        """Sync selection state across card/table views and update count label."""
+        self._update_selected_label()
+        # Sync card checkboxes
+        for k, cb in self._card_checkboxes.items():
+            cb.blockSignals(True)
+            cb.setChecked(k in self._selected_ids)
+            cb.blockSignals(False)
+        # Sync table checkboxes
+        for row in range(self.table.rowCount()):
+            cb = self.table.cellWidget(row, 0)
+            if isinstance(cb, CheckBox):
+                key = cb.property("itemKey")
+                if key is not None:
+                    cb.blockSignals(True)
+                    cb.setChecked(key in self._selected_ids)
+                    cb.blockSignals(False)
+
+    def _update_summary(self, items: list):
+        counts = {"pending": 0, "draft_saved": 0, "published": 0, "failed": 0}
+        for item in items:
+            status = item.get("raw_status", "draft")
+            if status in ("draft", "pending"):
+                counts["pending"] += 1
+            elif status == "draft_saved":
+                counts["draft_saved"] += 1
+            elif status == "published":
+                counts["published"] += 1
+            elif status == "failed":
+                counts["failed"] += 1
+        labels = {
+            "pending": "待发布",
+            "draft_saved": "草稿箱",
+            "published": "已发布",
+            "failed": "失败",
+        }
+        colors = {
+            "pending": PRIMARY,
+            "draft_saved": TEXT_SECONDARY,
+            "published": SUCCESS,
+            "failed": ERROR,
+        }
+        for key, widget in self.summary_labels.items():
+            widget.setText(f"{labels[key]}\n{counts[key]}")
+            widget.setStyleSheet(
+                f"background: {SURFACE_ALT}; border: 1px solid {colors[key]}; border-radius: 8px; "
+                f"padding: 8px; color: {colors[key]}; font-weight: 700;"
+            )
 
     def _populate_table_row(self, row: int, item: dict):
         """填充单行表格数据"""
         # Checkbox
         cb = CheckBox()
+        key = self._item_key(item)
+        cb.setProperty("itemKey", key)
+        cb.setChecked(key in self._selected_ids)
+        cb.stateChanged.connect(lambda state, k=key: self._on_item_checked(k, state))
         self.table.setCellWidget(row, 0, cb)
 
         # Product name
@@ -226,6 +516,23 @@ class PublishPage(QWidget):
         badge = StatusBadge(raw_status)
         badge.setFixedHeight(28)
         self.table.setCellWidget(row, 4, badge)
+
+        # Failure reason
+        failure_reason = item.get("failure_reason", "") or ""
+        if failure_reason:
+            retry_count = item.get("retry_count", 0) or 0
+            if retry_count > 0:
+                display_text = f"{failure_reason[:60]} (重试{retry_count}次)"
+                tooltip_text = f"{failure_reason} (重试{retry_count}次)"
+            else:
+                display_text = failure_reason[:60]
+                tooltip_text = failure_reason
+            reason_label = QLabel(display_text)
+            reason_label.setToolTip(tooltip_text)
+            reason_label.setStyleSheet(f"color: {ERROR}; font-size: 12px;")
+            self.table.setCellWidget(row, 5, reason_label)
+        else:
+            self.table.setItem(row, 5, QTableWidgetItem(""))
 
         # Actions
         self._populate_action_widget(row, item)
@@ -257,6 +564,25 @@ class PublishPage(QWidget):
         if isinstance(badge, StatusBadge):
             badge.set_status(raw_status)
 
+        # Update failure reason
+        failure_reason = item.get("failure_reason", "") or ""
+        old_reason_widget = self.table.cellWidget(row, 5)
+        if failure_reason:
+            retry_count = item.get("retry_count", 0) or 0
+            if retry_count > 0:
+                display_text = f"{failure_reason[:60]} (重试{retry_count}次)"
+                tooltip_text = f"{failure_reason} (重试{retry_count}次)"
+            else:
+                display_text = failure_reason[:60]
+                tooltip_text = failure_reason
+            reason_label = QLabel(display_text)
+            reason_label.setToolTip(tooltip_text)
+            reason_label.setStyleSheet(f"color: {ERROR}; font-size: 12px;")
+            self.table.setCellWidget(row, 5, reason_label)
+        else:
+            self.table.setCellWidget(row, 5, None)
+            self.table.setItem(row, 5, QTableWidgetItem(""))
+
     def _populate_action_widget(self, row: int, item: dict):
         """填充操作列"""
         action_widget = QWidget()
@@ -269,23 +595,34 @@ class PublishPage(QWidget):
         view_btn.clicked.connect(lambda _, r=row: self._on_view_detail(r))
         action_layout.addWidget(view_btn)
 
-        status = item.get("status", "草稿")
-        if status in ("草稿", "待发布", "发布失败"):
+        raw_status = item.get("raw_status", "draft")
+        if raw_status in ("draft", "pending", "draft_saved", "failed"):
             pub_btn = PushButton("发布")
             pub_btn.setFixedSize(50, 28)
             pub_btn.clicked.connect(lambda _, r=row: self._on_publish_single(r))
             action_layout.addWidget(pub_btn)
+
+            draft_btn = PushButton("草稿")
+            draft_btn.setFixedSize(50, 28)
+            draft_btn.clicked.connect(lambda _, r=row: self._on_draft_single(r))
+            action_layout.addWidget(draft_btn)
 
         del_btn = PushButton("删除")
         del_btn.setFixedSize(50, 28)
         del_btn.clicked.connect(lambda _, r=row: self._on_delete(r))
         action_layout.addWidget(del_btn)
 
-        self.table.setCellWidget(row, 5, action_widget)
+        self.table.setCellWidget(row, 6, action_widget)
 
     def _on_batch_image_loaded(self, index: int, path: str, pixmap):
-        """批量图片加载完成回调（暂不处理，表格图片通过按钮文字显示）"""
-        pass
+        """Update any thumbnail label registered for this async image request."""
+        label = self._thumb_labels.pop(index, None)
+        if not label:
+            return
+        try:
+            label.setPixmap(pixmap)
+        except RuntimeError:
+            pass
 
     def _note_images(self, item: dict) -> list:
         images = item.get("images") or []
@@ -800,12 +1137,32 @@ class PublishPage(QWidget):
     def set_progress(self, current: int, total: int):
         if total > 0:
             self.progress_bar.setValue(int(current / total * 100))
+            self.progress_label.setText(f"正在发布 {current}/{total}...")
         else:
             self.progress_bar.setValue(0)
+            self.progress_label.setText("")
 
     def _load_table_images(self, items: list):
         """后台加载表格中的图片"""
         pass  # 图片通过按钮文字显示，不需要实际加载
+
+    def _on_select_all(self, state):
+        """Toggle all row checkboxes when select-all is toggled"""
+        checked = state == Qt.Checked
+        for row in range(self.table.rowCount()):
+            cb = self.table.cellWidget(row, 0)
+            if isinstance(cb, CheckBox):
+                cb.setChecked(checked)
+        self._update_selected_count()
+
+    def _update_selected_count(self):
+        """Update the selected count label based on checked row checkboxes"""
+        count = 0
+        for row in range(self.table.rowCount()):
+            cb = self.table.cellWidget(row, 0)
+            if isinstance(cb, CheckBox) and cb.isChecked():
+                count += 1
+        self.selected_label.setText(f"已选 {count} 篇")
 
     def _on_refresh(self):
         """Reload from store"""
@@ -832,7 +1189,7 @@ class PublishPage(QWidget):
 
     def _on_publish_all(self):
         """Publish all pending items with confirmation"""
-        pending = [item for item in self._items if item.get("status") in ("草稿", "待发布", "发布失败")]
+        pending = [item for item in self._items if item.get("raw_status") in ("draft", "pending", "draft_saved", "failed")]
         if not pending:
             InfoBar.warning("提示", "没有待发布的笔记", parent=self)
             return
@@ -847,13 +1204,53 @@ class PublishPage(QWidget):
         if result == QMessageBox.Yes:
             self.publish_requested.emit(pending)
 
+    def _on_publish_draft(self):
+        """Publish selected items to XHS drafts box (草稿箱)"""
+        selected = []
+        for row in range(self.table.rowCount()):
+            cb = self.table.cellWidget(row, 0)
+            if isinstance(cb, CheckBox) and cb.isChecked():
+                selected.append(self._items[row])
+        if not selected:
+            # 没有勾选时，弹出提示询问是否全部发到草稿箱
+            pending = [item for item in self._items if item.get("raw_status") in ("draft", "pending", "draft_saved", "failed")]
+            if not pending:
+                InfoBar.warning("提示", "没有待发布的笔记", parent=self)
+                return
+            result = QMessageBox.question(
+                self,
+                "发布到草稿箱",
+                f"未勾选笔记，要将全部 {len(pending)} 篇发到草稿箱吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if result == QMessageBox.Yes:
+                self.draft_requested.emit(pending)
+            return
+        self.draft_requested.emit(selected)
+
     def _on_publish_single(self, row):
         if 0 <= row < len(self._items):
             self.publish_requested.emit([self._items[row]])
 
+    def _on_draft_single(self, row):
+        if 0 <= row < len(self._items):
+            self.draft_requested.emit([self._items[row]])
+
     def _on_delete(self, row):
         if 0 <= row < len(self._items):
             item = self._items[row]
+
+            result = QMessageBox.question(
+                self,
+                "确认删除",
+                "确定删除这篇笔记记录吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if result != QMessageBox.Yes:
+                return
+
             note_id = item.get("id")
             if note_id:
                 try:
@@ -896,3 +1293,27 @@ class PublishPage(QWidget):
             InfoBar.success("已删除", f"已删除 {count} 篇笔记记录", parent=self)
         except Exception as e:
             InfoBar.error("删除失败", str(e), parent=self)
+
+    def _on_retry_failed(self):
+        """将所有失败项重置为待发布并触发发布"""
+        try:
+            from src.database.generated_store import get_failed_notes, reset_notes_to_pending
+            failed = get_failed_notes()
+            if not failed:
+                InfoBar.info("提示", "没有失败的笔记", parent=self)
+                return
+
+            ids = [n["id"] for n in failed]
+            count = reset_notes_to_pending(ids)
+            InfoBar.success("已重置", f"{count} 篇失败笔记已重置为待发布", parent=self)
+
+            # 重新加载列表
+            self._on_refresh()
+
+            # 只发布刚刚重置的那些项（按 id 匹配），不发布所有 pending
+            reset_items = [item for item in self._items if item.get("id") in ids]
+            if reset_items:
+                self.publish_requested.emit(reset_items)
+        except Exception as e:
+            logger.error("Retry failed notes error: %s", e)
+            InfoBar.error("重试失败", str(e), parent=self)

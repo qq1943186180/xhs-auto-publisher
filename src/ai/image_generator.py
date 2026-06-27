@@ -10,16 +10,24 @@ import time
 import logging
 import threading
 import uuid
+import subprocess
+import sys
 import urllib.request
 import urllib.error
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .prompt_templates import get_all_image_prompts
+from src.utils import get_logger
+from src.utils.kimi_webbridge import (
+    describe_kimi_status,
+    ensure_kimi_webbridge,
+    read_kimi_status,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger("image_generator")
 
 # ========== 常量 ==========
 # Kimi WebBridge 地址从环境变量读取，默认 127.0.0.1:10086
@@ -28,22 +36,39 @@ KIMI_STATUS_URL = KIMI_URL.rsplit("/command", 1)[0] + "/status" if "/command" in
 SESSION = "xhs-img-gen"
 POLL_SHORT = 1
 POLL_MEDIUM = 3
-POLL_LONG = 5
+POLL_LONG = 3
 IMG_SIZE_THRESHOLD = 1000
 IMG_BODY_MIN_LEN = 1000
 FETCH_MAX_RETRY = 3
 SEND_MAX_RETRY = 2
 PREVIEW_MAX_WAIT = 15
 PAGE_READY_TIMEOUT = 30
-IMAGE_GEN_TIMEOUT = 120
+IMAGE_GEN_TIMEOUT = 300
 UPLOAD_TIMEOUT = 30
 DETAIL_TIMEOUT = 60
 MAX_IMG_SIZE_MB = 10
-MAX_PARALLEL_WORKERS = 3
+MAX_PARALLEL_WORKERS = 2
 UPLOAD_LOCK = threading.Lock()
 
 # 可重试的错误关键字
 _RETRYABLE_KEYWORDS = ("timeout", "timed out", "connection", "network", "reset", "refused")
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    """Hide helper console windows when running from the GUI on Windows."""
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+
+
+def _run_hidden(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    kwargs.update(_hidden_subprocess_kwargs())
+    return subprocess.run(cmd, **kwargs)
 
 
 # ========== Kimi API ==========
@@ -81,6 +106,120 @@ def poll_until(predicate, timeout, interval=POLL_SHORT, label=""):
     return None
 
 
+# ========== API 直连生图（绕过 ChatGPT / Cloudflare）==========
+
+# 优先级从高到低：速度快、质量好的排前面
+_API_IMAGE_MODELS = [
+    "Kwai-Kolors/Kolors",
+    "Tongyi-MAI/Z-Image-Turbo",
+    "baidu/ERNIE-Image-Turbo",
+    "Tongyi-MAI/Z-Image",
+]
+
+
+def _get_api_client():
+    """获取 OpenAI 兼容的 API 客户端（优先 SiliconFlow）。"""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None, None
+    try:
+        from .api_key_manager import get_key_manager, Provider
+        km = get_key_manager()
+        # 优先 OpenAI 兼容 key（通常是 SiliconFlow）
+        entry = km.get_key(Provider.OPENAI)
+        if not entry:
+            entry = km.get_key()
+        if not entry:
+            return None, None
+        client = OpenAI(api_key=entry.api_key, base_url=entry.base_url, timeout=60)
+        return client, entry
+    except Exception as e:
+        logger.debug("获取 API 客户端失败: %s", e)
+        return None, None
+
+
+def _pick_api_image_model(client) -> Optional[str]:
+    """从可用模型列表中挑选最佳图片模型。"""
+    try:
+        available = {m.id for m in client.models.list().data}
+    except Exception:
+        # 如果无法列出模型，直接尝试默认顺序
+        return _API_IMAGE_MODELS[0]
+    for model in _API_IMAGE_MODELS:
+        if model in available:
+            return model
+    # 兜底：匹配任何含 image/flux/kolors 的模型
+    for mid in available:
+        if any(kw in mid.lower() for kw in ("image", "flux", "kolors", "stable", "sdxl")):
+            return mid
+    return None
+
+
+def _download_image_from_url(url: str, dest_path: str, timeout: int = 30) -> bool:
+    """从 URL 下载图片并保存到本地。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        if len(data) < 1000:
+            logger.warning("API 图片太小: %d bytes", len(data))
+            return False
+        with open(dest_path, "wb") as f:
+            f.write(data)
+        logger.info("  API 图片已下载: %s (%d bytes)", dest_path, len(data))
+        return True
+    except Exception as e:
+        logger.error("下载 API 图片失败: %s", e)
+        return False
+
+
+def generate_single_image_via_api(
+    prompt: str,
+    output_path: str,
+    client=None,
+    model: Optional[str] = None,
+    size: str = "768x1024",
+) -> Optional[str]:
+    """通过 OpenAI 兼容 API 直连生成单张图片（不经过 ChatGPT 浏览器）。"""
+    if client is None:
+        client, entry = _get_api_client()
+        if client is None:
+            logger.error("无可用 API 客户端")
+            return None
+
+    if model is None:
+        model = _pick_api_image_model(client)
+        if model is None:
+            logger.error("未找到可用的图片生成模型")
+            return None
+
+    logger.info("  API 直连生图: model=%s, size=%s", model, size)
+    try:
+        result = client.images.generate(
+            model=model,
+            prompt=prompt,
+            n=1,
+            size=size,
+        )
+        img_data = result.data[0]
+        if img_data.url:
+            if _download_image_from_url(img_data.url, output_path):
+                return output_path
+        elif img_data.b64_json:
+            img_bytes = base64.b64decode(img_data.b64_json)
+            if len(img_bytes) < 1000:
+                logger.warning("API b64 图片太小: %d bytes", len(img_bytes))
+                return None
+            with open(output_path, "wb") as f:
+                f.write(img_bytes)
+            logger.info("  API b64 图片已保存: %s (%d bytes)", output_path, len(img_bytes))
+            return output_path
+    except Exception as e:
+        logger.error("API 生图失败: %s", e)
+    return None
+
+
 # ========== 页面操作 ==========
 
 def wait_for_page_ready(timeout=PAGE_READY_TIMEOUT, session=SESSION):
@@ -101,38 +240,166 @@ def wait_for_send_button(timeout=PREVIEW_MAX_WAIT, session=SESSION):
 
 
 def wait_for_image(timeout=IMAGE_GEN_TIMEOUT, session=SESSION):
-    """轮询检测 DALL-E 生成的大图（>800px，非上传预览小图）"""
+    """轮询检测 DALL-E 生成的大图（>500px，非上传预览小图）"""
     js = (
-        'var imgs=document.querySelectorAll(\'img[src*="estuary"]\');'
+        'var imgs=document.querySelectorAll(\'img[src*="estuary"], img[src*="oaiusercontent"]\');'
         "var count=0,url='';"
         "for(var i=0;i<imgs.length;i++){"
-        "if(imgs[i].naturalWidth>800&&imgs[i].naturalHeight>800)"
+        "if(imgs[i].naturalWidth>=500&&imgs[i].naturalHeight>=500)"
         "{count++;url=imgs[i].src;}}"
         "count+':'+url;"
     )
 
+    _poll_count = [0]
     def check():
+        _poll_count[0] += 1
+        if _poll_count[0] % 10 == 0:
+            elapsed = _poll_count[0] * POLL_LONG
+            logger.info("  DALL-E 生图中... 已等待 %ds/%ds", elapsed, timeout)
+            # 每60秒输出一次页面诊断
+            if _poll_count[0] % 20 == 0:
+                _log_page_diagnostics(session, elapsed)
         r = kimi_safe("evaluate", {"code": js}, session=session)
         val = str(r.get("data", {}).get("value", "0:"))
         parts = val.split(":", 1)
         if parts[0].isdigit() and int(parts[0]) > 0 and len(parts) > 1 and parts[1].startswith("http"):
             return parts[1]
         return None
-    return poll_until(check, timeout, POLL_LONG, "DALL-E 生图")
+    result = poll_until(check, timeout, POLL_LONG, "DALL-E 生图")
+    if not result:
+        # 超时时输出完整诊断
+        _log_page_diagnostics(session, timeout, is_timeout=True)
+    return result
+
+
+def _log_page_diagnostics(session, elapsed, is_timeout=False):
+    """输出 ChatGPT 页面诊断信息：所有 img 元素、错误文本、按钮状态"""
+    tag = "生图超时诊断" if is_timeout else "生图等待诊断"
+    try:
+        # 列出所有 img 元素的 src 和尺寸
+        js_imgs = (
+            'var imgs=document.querySelectorAll("img");'
+            "var info=[];"
+            "for(var i=0;i<Math.min(imgs.length,15);i++){"
+            "info.push(imgs[i].src.substring(0,80)+' ['+imgs[i].naturalWidth+'x'+imgs[i].naturalHeight+']');}"
+            "info.join('\\n');"
+        )
+        r = kimi_safe("evaluate", {"code": js_imgs}, session=session)
+        imgs_info = str(r.get("data", {}).get("value", ""))
+        logger.warning("[%s] 已等待%ds - 页面img元素:", tag, elapsed)
+        for line in imgs_info.split("\\n"):
+            if line.strip():
+                logger.warning("  %s", line.strip())
+
+        # 检查是否有错误提示
+        js_errors = (
+            'var errs=document.querySelectorAll("[class*=error], [class*=Error], [role=alert], '
+            "\[data-testid*=error]\");"
+            "var msgs=[];"
+            "for(var i=0;i<errs.length;i++){"
+            "var t=errs[i].innerText.trim();"
+            "if(t&&t.length<200) msgs.push(t);}"
+            "msgs.join(' | ');"
+        )
+        r = kimi_safe("evaluate", {"code": js_errors}, session=session)
+        errors = str(r.get("data", {}).get("value", ""))
+        if errors.strip():
+            logger.warning("[%s] 页面错误提示: %s", tag, errors[:300])
+
+        # 检查发送按钮状态
+        js_btn = (
+            'var btn=document.querySelector("button[data-testid=send-button]");'
+            "btn ? ('btn exists, disabled='+btn.disabled) : 'no send btn';"
+        )
+        r = kimi_safe("evaluate", {"code": js_btn}, session=session)
+        btn_info = str(r.get("data", {}).get("value", ""))
+        logger.warning("[%s] 发送按钮: %s", tag, btn_info)
+    except Exception as e:
+        logger.debug("[%s] 诊断异常: %s", tag, e)
 
 
 def upload_image_via_kimi(img_path, session=SESSION):
-    """用 Kimi WebBridge 原生 upload 功能上传图片"""
-    r = kimi("upload", {
-        "selector": "#upload-photos",
-        "files": [img_path]
-    }, session=session, timeout=UPLOAD_TIMEOUT)
-    ok = r.get("ok", False)
-    val = r.get("data", {})
-    if ok and val.get("success"):
-        logger.info("  Kimi upload 成功: %s 个文件", val.get('fileCount', 0))
+    """用 CDP DOM.setFileInputFiles 上传图片到 ChatGPT（最可靠）"""
+    if not os.path.isfile(img_path):
+        logger.error("图片文件不存在: %s", img_path)
+        return False
+
+    # 方式1: CDP 直连 Edge（最可靠，触发真实文件上传）
+    try:
+        r = _run_hidden(
+            ["curl.exe", "-s", "http://127.0.0.1:9222/json/list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            errors="replace",
+        )
+        tabs = json.loads(r.stdout)
+        chatgpt_tabs = [t for t in tabs if 'chatgpt.com' in t.get('url', '')]
+        if chatgpt_tabs:
+            import websocket as _ws_mod
+            ws = _ws_mod.create_connection(chatgpt_tabs[0]['webSocketDebuggerUrl'], timeout=10)
+            ws.settimeout(30)
+            try:
+                def _cdp(method, params=None, cmd_id=1):
+                    msg = {'id': cmd_id, 'method': method}
+                    if params:
+                        msg['params'] = params
+                    ws.send(json.dumps(msg))
+                    while True:
+                        resp = json.loads(ws.recv())
+                        if resp.get('id') == cmd_id:
+                            return resp
+
+                _cdp('DOM.enable')
+                r = _cdp('DOM.getDocument', {'depth': -1}, 1)
+                root_id = r['result']['root']['nodeId']
+                r = _cdp('DOM.querySelectorAll', {'nodeId': root_id, 'selector': '#upload-photos'}, 2)
+                node_ids = r.get('result', {}).get('nodeIds', [])
+                if node_ids:
+                    _cdp('DOM.setFileInputFiles',
+                         {'nodeId': node_ids[0], 'files': [os.path.abspath(img_path)]}, 3)
+                    logger.info("  图片上传成功 (CDP): %s", os.path.basename(img_path))
+                    return True
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug("  CDP 上传失败，降级: %s", e)
+
+    # 方式2: WebBridge drag-drop 降级
+    import base64 as _b64
+    with open(img_path, 'rb') as f:
+        b64_data = _b64.b64encode(f.read()).decode('ascii')
+    filename = os.path.basename(img_path)
+    mime = 'image/png' if img_path.lower().endswith('.png') else 'image/jpeg'
+
+    js = """
+    (async () => {
+      const b64 = 'B64DATA';
+      const binaryStr = atob(b64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for(let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+      const file = new File([bytes], 'FILENAME', {type: 'MIME'});
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const editor = document.querySelector('div.ProseMirror') || document.querySelector('form');
+      if (!editor) return 'no editor';
+      const drop = new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: dt});
+      editor.dispatchEvent(drop);
+      return 'ok';
+    })()
+    """.replace('B64DATA', b64_data).replace('FILENAME', filename).replace('MIME', mime)
+
+    r = kimi_safe("evaluate", {"code": js}, session=session, timeout=UPLOAD_TIMEOUT)
+    val = r.get("data", {}).get("value", "")
+    if val == "ok":
+        logger.info("  图片上传成功 (drag-drop): %s", filename)
         return True
-    logger.error("  Kimi upload 失败: %s", r)
+
+    logger.error("  图片上传失败: %s", r)
     return False
 
 
@@ -141,7 +408,17 @@ def fill_chinese(text, session=SESSION):
 
 
 def click_send(session=SESSION):
-    return kimi("click", {"selector": 'button[data-testid="send-button"]'}, session=session)
+    # 强制点击（即使按钮 disabled，CDP 上传后可能需要手动触发）
+    r = kimi_safe("evaluate", {
+        "code": """(() => {
+            const btn = document.querySelector('button[data-testid="send-button"]');
+            if (!btn) return 'no btn';
+            btn.disabled = false;
+            btn.click();
+            return 'clicked';
+        })()"""
+    }, session=session)
+    return r
 
 
 def download_via_network(dest_path, img_url, session=SESSION):
@@ -202,22 +479,29 @@ def download_via_network(dest_path, img_url, session=SESSION):
 
 
 def download_fallback(dest_path, session=SESSION):
-    """截图 fallback"""
-    r = kimi_safe("screenshot", {}, session=session, timeout=15)
-    img = r.get("data", {}).get("data", "")
-    if not img:
-        return False
-    # 修复 base64 padding bug：原代码 4 - len % 4 可能得到 4（不需要 padding 时）
-    padding = (4 - len(img) % 4) % 4
-    if padding != 0:
-        img += '=' * padding
+    """截图 fallback（含 session 健康检查，防止对离线 session 截图导致崩溃）"""
     try:
+        # 先检查 session 是否仍然存活
+        health = kimi_safe("evaluate", {"code": "document.readyState"}, session=session, timeout=10)
+        ready_state = str(health.get("data", {}).get("value", ""))
+        if not ready_state:
+            logger.warning("截图 fallback 跳过：session 无响应（可能已离线）")
+            return False
+
+        r = kimi_safe("screenshot", {}, session=session, timeout=15)
+        img = r.get("data", {}).get("data", "")
+        if not img:
+            return False
+        # 修复 base64 padding bug：原代码 4 - len % 4 可能得到 4（不需要 padding 时）
+        padding = (4 - len(img) % 4) % 4
+        if padding != 0:
+            img += '=' * padding
         img_bytes = base64.b64decode(img)
         with open(dest_path, 'wb') as f:
             f.write(img_bytes)
         return True
     except Exception as e:
-        logger.error("截图解码失败: %s", e)
+        logger.error("截图 fallback 异常: %s", e)
         return False
 
 
@@ -252,12 +536,18 @@ def validate_image(path):
 
 def check_kimi_health() -> bool:
     """检查 Kimi WebBridge 是否可用"""
-    try:
-        resp = urllib.request.urlopen(KIMI_STATUS_URL, timeout=5)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data.get("running") and data.get("extension_connected")
-    except Exception:
-        return False
+    status = ensure_kimi_webbridge(start_if_needed=True, wait_seconds=5, logger=logger)
+    return status.ready
+
+
+def kimi_health_message(start_if_needed: bool = False) -> str:
+    """Return a user-facing Kimi WebBridge status message."""
+    status = (
+        ensure_kimi_webbridge(start_if_needed=True, wait_seconds=5, logger=logger)
+        if start_if_needed
+        else read_kimi_status()
+    )
+    return describe_kimi_status(status)
 
 
 def clear_chat(session=SESSION):
@@ -283,30 +573,123 @@ def _is_retryable_error(error: str) -> bool:
 def _open_chatgpt_session(session: str) -> bool:
     kimi_safe("close_session", {}, session=session, timeout=10)
     kimi("navigate", {"url": "https://chatgpt.com", "newTab": True}, session=session)
-    return bool(wait_for_page_ready(session=session))
+    if not wait_for_page_ready(session=session):
+        # 页面未就绪，检查是否是 Cloudflare 拦截或登录问题
+        page_info = _check_chatgpt_page_error(session)
+        if page_info:
+            raise RuntimeError(page_info)
+        return False
+    return True
 
 
-def _submit_prompt_and_download(prompt: str, output_path: str, session: str) -> Optional[str]:
+def _check_chatgpt_page_error(session: str) -> str:
+    """检查 ChatGPT 页面是否有 Cloudflare 拦截、登录墙等明确错误。"""
+    r = kimi_safe("evaluate", {
+        "code": """(() => {
+            const body = document.body.innerText || '';
+            const url = window.location.href;
+            if (/Unable to load site|Access denied|Cloudflare|Ray ID|blocked/i.test(body)) {
+                const ipMatch = body.match(/IP[:\\s]+([\\d.]+)/);
+                return 'CLOUDFLARE_BLOCK:' + (ipMatch ? ipMatch[1] : '') + ':' + body.substring(0, 150);
+            }
+            if (/login|sign in|log in/i.test(body) && !document.querySelector('div.ProseMirror')) {
+                return 'LOGIN_REQUIRED:' + url;
+            }
+            if (/chatgpt\\.com.*\\?/i.test(url) && !document.querySelector('div.ProseMirror')) {
+                return 'REDIRECT:' + url;
+            }
+            return '';
+        })()"""
+    }, session=session, timeout=10)
+    val = str(r.get("data", {}).get("value", ""))
+    if val.startswith("CLOUDFLARE_BLOCK:"):
+        ip = val.split(":")[1] if ":" in val else ""
+        return f"ChatGPT 被 Cloudflare 拦截（IP: {ip}），请更换代理/VPN 后重试"
+    if val.startswith("LOGIN_REQUIRED:"):
+        return "ChatGPT 未登录，请在浏览器中登录 ChatGPT 后重试"
+    if val.startswith("REDIRECT:"):
+        return f"ChatGPT 页面异常跳转: {val[9:60]}，请检查网络和登录状态"
+    return ""
+
+
+def _verify_prompt_sent(session: str) -> bool:
+    """验证提示词是否成功发送：编辑器清空 或 有生成中指示。"""
+    js = """(() => {
+        // 检查1: 编辑器文本是否已清空
+        var editor = document.querySelector('div.ProseMirror');
+        var editorEmpty = !editor || (editor.innerText || '').trim().length === 0;
+
+        // 检查2: 是否有"停止生成"按钮（表示 DALL-E 正在工作）
+        var stopBtn = document.querySelector('[data-testid="stop-button"]');
+        var hasStop = !!stopBtn;
+
+        // 检查3: 是否有 loading/生成中 动画
+        var loading = document.querySelector('[class*="loading"], [class*="generating"], [class*="typing"]');
+        var hasLoading = loading && loading.offsetParent !== null;
+
+        // 检查4: 是否有助手回复区域（表示有对话在进行）
+        var assistantMsg = document.querySelector('[data-message-author-role="assistant"]');
+        var hasAssistant = !!assistantMsg;
+
+        var result = editorEmpty || hasStop || hasLoading || hasAssistant;
+        return result.toString() + '|editor=' + editorEmpty + '|stop=' + hasStop + '|loading=' + hasLoading + '|assistant=' + hasAssistant;
+    })()"""
+    r = kimi_safe("evaluate", {"code": js}, session=session)
+    val = str(r.get("data", {}).get("value", ""))
+    # 解析结果
+    parts = val.split("|")
+    is_sent = parts[0].strip() == "true" if parts else False
+    logger.info("  发送验证: %s (%s)", "通过" if is_sent else "失败", val[:120])
+    return is_sent
+
+
+def _editor_text_length(session: str) -> int:
+    r = kimi_safe("evaluate", {
+        "code": 'document.querySelector("div.ProseMirror")?.innerText?.trim()?.length ?? -1'
+    }, session=session, timeout=10)
+    try:
+        return int(r.get("data", {}).get("value", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _webbridge_fill_and_send(prompt: str, session: str) -> bool:
     logger.info("  填入提示词...")
     fill_chinese(prompt, session=session)
     time.sleep(POLL_MEDIUM)
 
     logger.info("  发送...")
     if not wait_for_send_button(session=session):
-        logger.error("发送按钮未就绪")
-        return None
+        logger.warning("发送按钮未就绪，尝试直接点击兜底")
     click_send(session=session)
     time.sleep(POLL_MEDIUM)
 
     for attempt in range(SEND_MAX_RETRY):
-        r = kimi_safe("evaluate", {
-            'code': 'document.querySelector("div.ProseMirror")?.innerText?.length'
-        }, session=session)
-        if r.get("data", {}).get("value", -1) == 0:
-            break
-        logger.info("  重试发送 %s/%s", attempt + 1, SEND_MAX_RETRY)
+        if _verify_prompt_sent(session):
+            return True
+        length = _editor_text_length(session)
+        logger.info("  重试发送 %s/%s（编辑器剩余 %s 字）", attempt + 1, SEND_MAX_RETRY, length)
         click_send(session=session)
         time.sleep(2)
+
+    return _verify_prompt_sent(session)
+
+
+def _submit_prompt_and_download(prompt: str, output_path: str, session: str) -> Optional[str]:
+    sent = _webbridge_fill_and_send(prompt, session=session)
+    if not sent:
+        logger.warning("WebBridge 发送未确认，尝试 CDP 兜底发送")
+        sent = _cdp_fill_and_send(prompt)
+        if sent:
+            time.sleep(2)
+            sent = _verify_prompt_sent(session)
+
+    if not sent:
+        page_error = _check_chatgpt_page_error(session)
+        if page_error:
+            raise RuntimeError(page_error)
+        logger.error("提示词未成功发送（编辑器仍有文本且无生成指示），跳过 DALL-E 等待")
+        return None
 
     logger.info("  等待 DALL-E 生图...")
     img_url = wait_for_image(session=session)
@@ -321,11 +704,81 @@ def _submit_prompt_and_download(prompt: str, output_path: str, session: str) -> 
         return output_path
 
     logger.warning("network 下载失败，截图 fallback...")
-    fallback_path = output_path.replace(".png", "_screenshot.png")
-    if download_fallback(fallback_path, session=session):
-        logger.info("  ⚠️ 截图: %s", fallback_path)
-        return fallback_path
+    try:
+        fallback_path = output_path.replace(".png", "_screenshot.png")
+        if download_fallback(fallback_path, session=session):
+            logger.info("  ⚠️ 截图: %s", fallback_path)
+            return fallback_path
+    except Exception as e:
+        logger.error("截图 fallback 外层异常: %s", e)
     return None
+
+
+def _cdp_fill_and_send(prompt: str) -> bool:
+    """用 CDP 直接填写提示词并发送（绕过 WebBridge）"""
+    try:
+        r = _run_hidden(
+            ["curl.exe", "-s", "http://127.0.0.1:9222/json/list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            errors="replace",
+        )
+        tabs = json.loads(r.stdout)
+        ct = [t for t in tabs if 'chatgpt.com' in t.get('url', '')]
+        if not ct:
+            return False
+        import websocket as _ws_mod
+        ws = _ws_mod.create_connection(ct[0]['webSocketDebuggerUrl'], timeout=10)
+        ws.settimeout(30)
+        try:
+            def _cdp(method, params=None, cmd_id=1):
+                msg = {'id': cmd_id, 'method': method}
+                if params:
+                    msg['params'] = params
+                ws.send(json.dumps(msg))
+                while True:
+                    resp = json.loads(ws.recv())
+                    if resp.get('id') == cmd_id:
+                        return resp
+
+            _cdp('Runtime.enable')
+            # 填提示词
+            safe_prompt = json.dumps(prompt)
+            _cdp('Runtime.evaluate', {'expression': f"""
+                (() => {{
+                    const editor = document.querySelector('div.ProseMirror');
+                    if (!editor) return 'no editor';
+                    editor.focus();
+                    editor.innerHTML = '<p>' + {safe_prompt} + '</p>';
+                    editor.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    return 'filled';
+                }})()
+            """, 'returnByValue': True}, 10)
+
+            time.sleep(1)
+
+            # 强制发送
+            _cdp('Runtime.evaluate', {'expression': """
+                (() => {
+                    const btn = document.querySelector('button[data-testid="send-button"]');
+                    if (!btn) return 'no btn';
+                    btn.disabled = false;
+                    btn.click();
+                    return 'clicked';
+                })()
+            """, 'returnByValue': True}, 11)
+
+            return True
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("CDP fill/send 失败: %s", e)
+        return False
 
 
 def _composer_attachment_count(session=SESSION) -> int:
@@ -406,6 +859,41 @@ class ImageResult:
     results: list[dict] = field(default_factory=list)
 
 
+def _worker_result(
+    index: int,
+    style: str,
+    label: str,
+    result_path: Optional[str],
+    error: str = "",
+    method: str = "kimi-webbridge",
+    provider: str = "chatgpt",
+    model: str = "dall-e-3",
+) -> dict:
+    if result_path:
+        return {
+            "index": index,
+            "style": style,
+            "label": label,
+            "status": "image",
+            "path": result_path,
+            "error": "",
+            "method": method,
+            "provider": provider,
+            "model": model,
+        }
+    return {
+        "index": index,
+        "style": style,
+        "label": label,
+        "status": "failed",
+        "path": "",
+        "error": error or "生成失败或超时，请重试",
+        "method": method,
+        "provider": provider,
+        "model": model,
+    }
+
+
 def generate_images(
     product_name: str,
     output_dir: str,
@@ -433,12 +921,52 @@ def generate_images(
     Returns:
         ImageResult
     """
+    style_names = ["style_a", "style_b", "style_c"]
+    style_labels = ["博主风", "纯白简约", "氛围场景"]
+    if style_indices is None:
+        selected_indices = list(range(min(count, len(style_names))))
+    else:
+        selected_indices = [
+            i for i in style_indices
+            if isinstance(i, int) and 0 <= i < len(style_names)
+        ]
+    if not selected_indices:
+        return ImageResult(images=[], method="kimi-webbridge", provider="chatgpt", model="dall-e-3")
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # 检查 Kimi WebBridge
-    if not check_kimi_health():
-        logger.error("Kimi WebBridge 不可用，请确保浏览器扩展已连接 (%s)", KIMI_URL)
-        return ImageResult(images=[], method="kimi-webbridge", provider="chatgpt", model="dall-e-3")
+    kimi_status = ensure_kimi_webbridge(start_if_needed=True, wait_seconds=8, logger=logger)
+    kimi_ready = kimi_status.ready
+    use_api_only = False
+
+    if not kimi_ready:
+        message = describe_kimi_status(kimi_status)
+        logger.warning("Kimi WebBridge 不可用: %s，尝试 API 直连生图", message)
+        # 检查 API 直连是否可用
+        api_client, api_entry = _get_api_client()
+        if api_client is not None:
+            use_api_only = True
+            logger.info("使用 API 直连生图（%s）", api_entry.base_url)
+        else:
+            logger.error("Kimi 不可用且无 API 客户端")
+            return ImageResult(
+                images=[],
+                method="kimi-webbridge",
+                provider="chatgpt",
+                model="dall-e-3",
+                results=[
+                    {
+                        "index": i,
+                        "style": style_names[i],
+                        "label": style_labels[i],
+                        "status": "failed",
+                        "path": "",
+                        "error": message,
+                    }
+                    for i in selected_indices
+                ],
+            )
 
     # 读取产品图片
     has_product_image = False
@@ -449,18 +977,11 @@ def generate_images(
         logger.warning("无产品原图，将使用纯文字提示词生图")
 
     # 获取3种风格的提示词
-    prompts = get_all_image_prompts(product_name, product_context=product_context)
-    style_names = ["style_a", "style_b", "style_c"]
-    style_labels = ["博主风", "纯白简约", "氛围场景"]
-    if style_indices is None:
-        selected_indices = list(range(min(count, len(prompts), len(style_names))))
-    else:
-        selected_indices = [
-            i for i in style_indices
-            if isinstance(i, int) and 0 <= i < len(prompts) and i < len(style_names)
-        ]
-    if not selected_indices:
-        return ImageResult(images=[], method="kimi-webbridge", provider="chatgpt", model="dall-e-3")
+    prompts = get_all_image_prompts(
+        product_name,
+        product_context=product_context,
+        has_attachment=has_product_image,
+    )
 
     run_token = str(int(time.time() * 1000))
 
@@ -475,21 +996,29 @@ def generate_images(
         output_path = os.path.join(output_dir, f"xhs_{style}.png")
         logger.info("正在生成第 %s/%s 张图片（%s，session=%s）...", i + 1, count, style, session)
 
-        # 每个 worker 开始时再次检查 kimi health
-        if not check_kimi_health():
-            return {
-                "index": i,
-                "style": style,
-                "label": style_labels[i],
-                "status": "failed",
-                "path": "",
-                "error": "Kimi WebBridge 不可用",
-            }
-
         result_path = None
         error = ""
+        method = "kimi-webbridge"
+        provider = "chatgpt"
+        model_name = "dall-e-3"
+
+        # ── 模式 A：API 直连（Kimi 不可用或主动降级）──
+        if use_api_only:
+            logger.info("  [API 直连] 生成 %s ...", style)
+            result_path = generate_single_image_via_api(prompt, output_path)
+            if result_path:
+                method = "api-direct"
+                provider = "siliconflow"
+                model_name = _pick_api_image_model(_get_api_client()[0]) or "Kolors"
+            else:
+                error = "API 直连生图失败，请检查网络和 API Key"
+            return _worker_result(i, style, style_labels[i], result_path, error, method, provider, model_name)
+
+        # ── 模式 B：Kimi + ChatGPT（Cloudflare 拦截时降级到 API）──
         try:
-            if not _open_chatgpt_session(session):
+            if not check_kimi_health():
+                error = "Kimi WebBridge 不可用"
+            elif not _open_chatgpt_session(session):
                 error = "ChatGPT 页面加载超时"
             elif has_product_image:
                 result_path = generate_single_image(
@@ -504,9 +1033,23 @@ def generate_images(
 
             if not result_path and not error:
                 error = "生成失败或超时，请重试"
+        except RuntimeError as e:
+            error_msg = str(e)
+            # Cloudflare 拦截或登录问题 → 降级到 API 直连
+            if "Cloudflare" in error_msg or "拦截" in error_msg or "未登录" in error_msg:
+                logger.warning("ChatGPT 不可用（%s），降级到 API 直连生图", error_msg)
+                result_path = generate_single_image_via_api(prompt, output_path)
+                if result_path:
+                    method = "api-direct"
+                    provider = "siliconflow"
+                    model_name = _pick_api_image_model(_get_api_client()[0]) or "Kolors"
+                    error = ""
+                else:
+                    error = f"{error_msg}；API 直连也失败"
+            else:
+                error = error_msg
         except Exception as e:
             error = str(e)
-            # 区分可重试和不可重试错误
             if _is_retryable_error(error):
                 logger.warning("图片生成遇到可重试错误（%s）: %s", style, e)
             else:
@@ -514,23 +1057,7 @@ def generate_images(
         finally:
             kimi_safe("close_session", {}, session=session, timeout=10)
 
-        if result_path:
-            return {
-                "index": i,
-                "style": style,
-                "label": style_labels[i],
-                "status": "image",
-                "path": result_path,
-                "error": "",
-            }
-        return {
-            "index": i,
-            "style": style,
-            "label": style_labels[i],
-            "status": "failed",
-            "path": "",
-            "error": error or "生成失败或超时，请重试",
-        }
+        return _worker_result(i, style, style_labels[i], result_path, error, method, provider, model_name)
 
     max_workers = 1 if len(selected_indices) == 1 else min(len(selected_indices), MAX_PARALLEL_WORKERS)
     if max_workers > 1:
@@ -540,7 +1067,14 @@ def generate_images(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(worker, i) for i in selected_indices]
         for future in as_completed(futures):
-            results.append(future.result())
+            try:
+                results.append(future.result(timeout=400))
+            except FuturesTimeoutError:
+                logger.error("Image worker timed out after 400s")
+                results.append(_worker_result(-1, "", "", "", "图片生成超时", "timeout", "", ""))
+            except Exception as exc:
+                logger.error("Image worker raised exception: %s", exc)
+                results.append(_worker_result(-1, "", "", "", str(exc), "error", "", ""))
 
     results.sort(key=lambda item: item.get("index", 999))
     images = [
