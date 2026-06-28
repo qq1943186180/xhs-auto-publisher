@@ -660,15 +660,27 @@ class QianfanCollector:
                     if url in self._downloaded:
                         # 已下载，检查本地文件是否存在
                         if os.path.exists(local_path):
-                            product.local_images.append(local_path)
-                            skipped += 1
-                            continue
+                            # 验证并转换图片（WEBP->JPG）
+                            final_path = self._validate_and_convert_image(local_path)
+                            if final_path:
+                                product.local_images.append(final_path)
+                                skipped += 1
+                            else:
+                                # 图片无效，重新下载
+                                self._downloaded.discard(url)
+                                logger.info("图片无效，重新下载: %s", url)
+                                continue
                     success = await self._download_image(session, url, local_path)
                     if success:
-                        product.local_images.append(local_path)
-                        self._downloaded.add(url)
-                        self._save_progress()
-                        downloaded += 1
+                        # 验证并转换图片（WEBP->JPG）
+                        final_path = self._validate_and_convert_image(local_path)
+                        if final_path:
+                            product.local_images.append(final_path)
+                            self._downloaded.add(url)
+                            self._save_progress()
+                            downloaded += 1
+                        else:
+                            logger.warning("下载的图片无效: %s", url)
                     await AntiDetect.human_like_delay(0.3, 1.0)
 
         logger.info("图片下载完成：下载 %s 张，跳过 %s 张", downloaded, skipped)
@@ -703,6 +715,54 @@ class QianfanCollector:
                     await asyncio.sleep(2 ** attempt)
 
         return False
+
+    def _validate_and_convert_image(self, local_path: str) -> str:
+        """
+        验证图片文件是否有效，如果是 WEBP 则转换成 JPG
+        返回最终的图片路径（可能已转换），如果无效则返回空字符串
+        """
+        if not os.path.exists(local_path):
+            return ""
+        
+        # 检查文件大小（有效图片至少 10KB）
+        file_size = os.path.getsize(local_path)
+        if file_size < 10240:
+            logger.warning("图片文件过小（%s bytes），删除: %s", file_size, local_path)
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return ""
+        
+        # 检查文件格式并转换 WEBP 为 JPG
+        try:
+            from PIL import Image
+            # 验证文件是否完整
+            img = Image.open(local_path)
+            img.verify()
+            
+            # 如果是 WEBP，转换成 JPG
+            if local_path.lower().endswith('.webp'):
+                jpg_path = local_path.rsplit('.', 1)[0] + '.jpg'
+                img = Image.open(local_path)  # verify() 后需要重新打开
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                img.save(jpg_path, 'JPEG', quality=95)
+                logger.info("WEBP 转 JPG: %s -> %s", local_path, jpg_path)
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+                return jpg_path
+            
+            return local_path
+        except Exception as e:
+            logger.warning("图片验证失败，删除: %s (%s)", local_path, e)
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return ""
 
     def _get_product_dir(self, product: Product) -> str:
         """获取商品图片保存目录"""
