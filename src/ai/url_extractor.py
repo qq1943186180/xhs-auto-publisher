@@ -2,7 +2,8 @@
 URL 内容提取模块
 方案1：Jina Reader API (r.jina.ai) 读取网页
 方案2：直接抓取网页 HTML
-方案3：降级 - 返回失败，让用户手动输入
+方案3：从 URL path 解码标题（适合 MSN / 今日头条等 JS 渲染页）
+方案4：降级 - 返回失败，让用户手动输入
 
 代理配置（按优先级）：
   1. 环境变量 XHS_PROXY / HTTPS_PROXY / HTTP_PROXY
@@ -24,6 +25,9 @@ _BAD_TOPICS = {
     "question", "explore", "index", "home", "search", "login",
     "error", "403", "404", "access denied", "参数错误",
     "www", "com", "cn", "org", "net", "html", "php",
+    # 纯品牌名（JS 渲染页静态 HTML 常见）
+    "msn", "weibo", "bilibili", "baidu", "zhihu",
+    "xiaohongshu", "toutiao", "douyin", "taobao", "tmall",
 }
 
 # 网站域名映射
@@ -91,6 +95,11 @@ def extract_url_content(url: str) -> dict:
         return {}
 
     url = url.strip()
+    # 处理用户误粘贴两个 URL 拼在一起的情况（取第一个）
+    second_http = url.find("http", 4)
+    if second_http != -1:
+        url = url[:second_http].rstrip("?&")
+
     if not url.startswith("http"):
         url = "https://" + url
 
@@ -108,7 +117,13 @@ def extract_url_content(url: str) -> dict:
         logger.info("直接抓取提取成功: %s", result.get("topic"))
         return result
 
-    # 方案3：提取失败，返回空（让UI提示手动输入）
+    # 方案3：从 URL path 解码（适合 MSN / 今日头条等 JS 渲染页）
+    path_topic = _extract_from_url_path(url)
+    if path_topic and _is_valid_topic(path_topic):
+        logger.info("URL路径提取成功: %s", path_topic)
+        return {"topic": path_topic, "title": path_topic, "summary": "", "content": ""}
+
+    # 方案4：提取失败，返回空（让UI提示手动输入）
     logger.warning("URL 提取失败，所有方案均未获得有效主题")
     return {}
 
@@ -219,6 +234,38 @@ def _extract_summary(content: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > 20:
         return text[:500]
+    return ""
+
+
+def _extract_from_url_path(url: str) -> str:
+    """
+    从 URL path 解码标题。
+    适合 MSN / 今日头条 / 腾讯新闻等 JS 渲染页面，
+    这类页面把文章标题直接编码进 URL path。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        segments = [s for s in parsed.path.strip("/").split("/") if s]
+        # 去掉纯 ID 段，如 ar-AA266obs、article/12345678、p/abcdef
+        meaningful = [
+            s for s in segments
+            if not re.match(r'^(ar|p|article|post|item|news|video|A|id)-?[A-Za-z0-9]{4,}$', s, re.IGNORECASE)
+            and not re.match(r'^\d{6,}$', s)
+        ]
+        if not meaningful:
+            return ""
+        last = meaningful[-1]
+        # 去掉文件扩展名
+        last = re.sub(r'\.(html?|php|aspx?|jsp).*$', '', last, flags=re.IGNORECASE)
+        # percent 解码
+        last = urllib.parse.unquote(last)
+        # 连字符/下划线 → 空格（URL slug 转可读标题）
+        last = re.sub(r'[-_]+', ' ', last)
+        last = re.sub(r'\s+', ' ', last).strip()
+        if len(last) >= 5:
+            return last[:80]
+    except Exception:
+        pass
     return ""
 
 
