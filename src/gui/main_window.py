@@ -441,6 +441,7 @@ class MainWindow(FluentWindow):
             image_limit = _images_per_product_config()
             for p in data.get("products", []):
                 products.append({
+                    "item_id": p.get("item_id", ""),
                     "title": p.get("title", ""),
                     "local_images": p.get("local_images", [])[:image_limit],
                     "main_images": p.get("main_images", [])[:image_limit],

@@ -266,6 +266,24 @@ class TaskListPage(QWidget):
             if isinstance(cb, CheckBox):
                 cb.setChecked(checked)
 
+    def _find_images_by_item_id(self, item_id: str) -> list:
+        """兜底：按 item_id 在图片目录里找匹配的商品图片目录"""
+        if not item_id:
+            return []
+        images_dir = os.path.join(COLLECTED_DIR, "images")
+        if not os.path.isdir(images_dir):
+            return []
+        for d in sorted(os.listdir(images_dir)):
+            dir_path = os.path.join(images_dir, d)
+            if os.path.isdir(dir_path) and d.startswith(item_id + "_"):
+                found = []
+                for f in sorted(os.listdir(dir_path)):
+                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        found.append(os.path.join(dir_path, f))
+                logger.info("Found images by item_id %s: %s", item_id, found[:2])
+                return found
+        return []
+
     def load_products(self, products: list):
         self._products = products
         self.table.setRowCount(len(products))
@@ -290,10 +308,18 @@ class TaskListPage(QWidget):
                 self._image_loader.load_single(row, existing_imgs[0], 48, 48)
                 img_label.setToolTip(f"已采集 {len(existing_imgs)}/{self._images_per_product()} 张")
             else:
-                logger.warning("No existing images for row %s: local_imgs=%s", row, local_imgs)
-                img_label.setText("无图")
-                img_label.setStyleSheet(f"color: {TEXT_MUTED};")
-                img_label.setToolTip(f"已采集 0/{self._images_per_product()} 张")
+                # 兜底：按 item_id 在图片目录里找
+                item_id = p.get("item_id", "")
+                fallback_imgs = self._find_images_by_item_id(item_id) if item_id else []
+                if fallback_imgs:
+                    logger.info("Fallback image for row %s (item_id=%s): %s", row, item_id, fallback_imgs[0])
+                    self._image_loader.load_single(row, fallback_imgs[0], 48, 48)
+                    img_label.setToolTip(f"已采集 {len(fallback_imgs)} 张 (兜底)")
+                else:
+                    logger.warning("No existing images for row %s: local_imgs=%s", row, local_imgs)
+                    img_label.setText("无图")
+                    img_label.setStyleSheet(f"color: {TEXT_MUTED};")
+                    img_label.setToolTip(f"已采集 0/{self._images_per_product()} 张")
             self.table.setCellWidget(row, 2, img_label)
 
             # Status (Chinese label)

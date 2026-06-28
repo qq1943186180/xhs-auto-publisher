@@ -800,6 +800,7 @@ class QianfanCollector:
         simple_products = []
         for p in products:
             simple_products.append({
+                "item_id": p.item_id,
                 "title": p.name,
                 "main_images": p.main_images[:self.images_per_product],
                 "detail_images": p.detail_images[:self.images_per_product],
