@@ -377,13 +377,19 @@ class TaskListPage(QWidget):
             if not img_loaded:
                 # 兜底2：从 main_images URL 直接加载（不需要本地文件）
                 main_imgs = p.get("main_images", [])
+                logger.info("图片加载调试: item_id=%s, local_images=%s, main_images=%s",
+                           p.get("item_id", ""), local_imgs, main_imgs)
                 for url in main_imgs[:1]:
+                    logger.info("尝试从URL加载图片: %s", url)
                     pixmap = self._load_image_from_url(url, 48, 48)
                     if pixmap:
                         img_label.setPixmap(pixmap)
                         img_loaded = True
                         img_label.setToolTip(f"已采集 {len(main_imgs)} 张 (在线)")
+                        logger.info("URL加载成功: %s", url)
                         break
+                    else:
+                        logger.warning("URL加载失败: %s", url)
             if not img_loaded:
                 img_label.setText("无图")
                 img_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
