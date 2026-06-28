@@ -10,6 +10,8 @@ from pathlib import Path
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QLabel, QTableWidgetItem, QFrame, QMessageBox
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QImage
+from PIL import Image as PILImage
+import io
 
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, PushButton, TableWidget,
@@ -49,6 +51,38 @@ class TaskListPage(QWidget):
     collect_done = pyqtSignal()
     draft_edit_requested = pyqtSignal(int)
     draft_publish_requested = pyqtSignal(int)
+
+    @staticmethod
+    def _load_image_to_pixmap(img_path: str, width: int, height: int):
+        """
+        加载图片并返回缩放后的 QPixmap
+        优先用 QImage（快），失败则用 Pillow（支持 WEBP 等格式）
+        """
+        # 先试 QImage（支持 PNG/JPG/BMP）
+        image = QImage(img_path)
+        if not image.isNull():
+            return QPixmap.fromImage(image).scaled(
+                width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        # QImage 不支持此格式（如 WEBP），用 Pillow 转
+        try:
+            pil_img = PILImage.open(img_path)
+            if pil_img.mode in ('RGBA', 'P', 'LA', 'L'):
+                pil_img = pil_img.convert('RGB')
+            # Pillow -> QImage -> QPixmap
+            from io import BytesIO
+            buf = BytesIO()
+            pil_img.save(buf, format='JPEG', quality=95)
+            buf.seek(0)
+            qimg = QImage()
+            qimg.loadFromData(buf.getvalue())
+            if not qimg.isNull():
+                return QPixmap.fromImage(qimg).scaled(
+                    width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+        except Exception as e:
+            logger.warning("Pillow 加载失败: %s (%s)", img_path, e)
+        return None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -277,25 +311,22 @@ class TaskListPage(QWidget):
             title_item.setData(Qt.UserRole, p)
             self.table.setItem(row, 1, title_item)
 
-            # Image (sync load)
+            # Image (sync load) — 用 QImage 直接验证，不用文件大小过滤
             img_label = QLabel()
             img_label.setAlignment(Qt.AlignCenter)
             img_label.setFixedSize(52, 52)
             img_label.setStyleSheet("border: 1px solid #e5e7eb; border-radius: 4px;")
             local_imgs = p.get("local_images", [])
-            existing_imgs = []
-            for img in local_imgs:
-                if os.path.exists(img) and os.path.getsize(img) > 10000:  # 有效图片至少 10KB
-                    existing_imgs.append(img)
+            existing_imgs = [img for img in local_imgs if os.path.exists(img)]
             img_loaded = False
             if existing_imgs:
                 img_path = existing_imgs[0]
-                image = QImage(img_path)
-                if not image.isNull():
-                    pixmap = QPixmap.fromImage(image)
-                    scaled = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    img_label.setPixmap(scaled)
+                pixmap = self._load_image_to_pixmap(img_path, 48, 48)
+                if pixmap:
+                    img_label.setPixmap(pixmap)
                     img_loaded = True
+                else:
+                    logger.warning("图片加载失败（文件损坏或格式不支持）: %s", img_path)
                 img_label.setToolTip(f"已采集 {len(existing_imgs)}/{self._images_per_product()} 张")
             if not img_loaded:
                 # 兜底：按 item_id 在图片目录里找
@@ -308,11 +339,9 @@ class TaskListPage(QWidget):
                             if os.path.isdir(dir_path) and d.startswith(item_id + "_"):
                                 found = [os.path.join(dir_path, f) for f in sorted(os.listdir(dir_path)) if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
                                 if found and os.path.exists(found[0]):
-                                    image = QImage(found[0])
-                                    if not image.isNull():
-                                        pixmap = QPixmap.fromImage(image)
-                                        scaled = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                                        img_label.setPixmap(scaled)
+                                    pixmap = self._load_image_to_pixmap(found[0], 48, 48)
+                                    if pixmap:
+                                        img_label.setPixmap(pixmap)
                                         img_loaded = True
                                         img_label.setToolTip(f"已采集 {len(found)} 张 (兜底)")
                                         break
