@@ -286,9 +286,11 @@ class TaskListPage(QWidget):
             local_imgs = p.get("local_images", [])
             existing_imgs = [img for img in local_imgs if os.path.exists(img)]
             if existing_imgs:
+                logger.info("Loading image for row %s: %s", row, existing_imgs[0])
                 self._image_loader.load_single(row, existing_imgs[0], 48, 48)
                 img_label.setToolTip(f"已采集 {len(existing_imgs)}/{self._images_per_product()} 张")
             else:
+                logger.warning("No existing images for row %s: local_imgs=%s", row, local_imgs)
                 img_label.setText("无图")
                 img_label.setStyleSheet(f"color: {TEXT_MUTED};")
                 img_label.setToolTip(f"已采集 0/{self._images_per_product()} 张")
@@ -322,11 +324,17 @@ class TaskListPage(QWidget):
 
     def _on_image_loaded(self, index: int, path: str, pixmap):
         """异步图片加载完成回调"""
+        logger.info("_on_image_loaded called: index=%s, path=%s", index, path)
         if 0 <= index < self.table.rowCount():
             img_label = self.table.cellWidget(index, 2)
             if isinstance(img_label, QLabel):
                 scaled = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 img_label.setPixmap(scaled)
+                logger.info("Image set for row %s", index)
+            else:
+                logger.warning("img_label is not QLabel for row %s: %s", index, type(img_label))
+        else:
+            logger.warning("Index out of range: %s (rowCount=%s)", index, self.table.rowCount())
 
     def _on_collect(self):
         # 进程互斥检查

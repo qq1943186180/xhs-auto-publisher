@@ -63,17 +63,20 @@ class _ImageLoadWorker(QThread):
     def run(self):
         try:
             if not os.path.exists(self._path):
+                logger.warning("Image file not found: %s", self._path)
                 self.load_failed.emit(self._index, self._path, "文件不存在")
                 return
             # QImage 是线程安全的，可以在后台加载和缩放
             image = QImage(self._path)
             if image.isNull():
+                logger.warning("QImage is null for: %s", self._path)
                 self.load_failed.emit(self._index, self._path, "图片无法读取")
                 return
             scaled = image.scaled(
                 self._width, self._height,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation,
             )
+            logger.info("Image loaded successfully: %s (index=%s)", self._path, self._index)
             self.image_loaded.emit(self._index, self._path, scaled)
         except Exception as e:
             logger.warning("Image load failed for %s: %s", self._path, e)
@@ -134,6 +137,7 @@ class AsyncImageLoader(QObject):
 
     def _on_worker_finished(self, index: int, path: str, qimage: QImage):
         """主线程回调：将 QImage 转为 QPixmap（GUI 资源必须在主线程）"""
+        logger.info("_on_worker_finished: index=%s, path=%s", index, path)
         self._completed_count += 1
         pixmap = QPixmap.fromImage(qimage)
         self.image_loaded.emit(index, path, pixmap)
