@@ -640,8 +640,22 @@ class QianfanCollector:
 
         logger.info("开始下载图片，共 %s 张，已有进度 %s 张", total, len(self._downloaded))
 
+        # 从浏览器 Context 提取 Cookie，传给 aiohttp（小红书 CDN 需要登录态）
+        cookie_dict = {}
+        if self._browser and self._browser.context:
+            try:
+                cookies = await self._browser.context.cookies()
+                for c in cookies:
+                    cookie_dict[c["name"]] = c["value"]
+                logger.info("已提取 %s 个 Cookie 用于图片下载", len(cookie_dict))
+            except Exception as e:
+                logger.warning("提取 Cookie 失败: %s", e)
+
         connector = aiohttp.TCPConnector(limit=concurrency)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            cookies=cookie_dict or None,
+        ) as session:
             for product in products:
                 product_dir = self._get_product_dir(product)
                 os.makedirs(product_dir, exist_ok=True)
