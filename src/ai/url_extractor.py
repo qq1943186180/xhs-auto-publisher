@@ -3,8 +3,13 @@ URL 内容提取模块
 方案1：Jina Reader API (r.jina.ai) 读取网页
 方案2：直接抓取网页 HTML
 方案3：降级 - 返回失败，让用户手动输入
+
+代理配置（按优先级）：
+  1. 环境变量 XHS_PROXY / HTTPS_PROXY / HTTP_PROXY
+  2. config_manager xhs.proxy 字段
+超时配置：config_manager xhs.timeout（默认 15s）
 """
-import logging
+import os
 import urllib.request
 import urllib.parse
 import re
@@ -34,6 +39,46 @@ _DOMAIN_NAMES = {
     "jd.com": "京东",
     "tmall": "天猫",
 }
+
+
+def _get_proxy() -> str:
+    """读取代理配置（环境变量优先，其次 config_manager）"""
+    # 1. 环境变量（与 llm_client 保持一致）
+    proxy = (
+        os.environ.get("XHS_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if proxy:
+        return proxy
+    # 2. config_manager
+    try:
+        from src.config.config_manager import get_config_manager
+        return get_config_manager().get("xhs.proxy", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_timeout() -> float:
+    """读取超时配置（config_manager xhs.timeout，默认 15s）"""
+    try:
+        from src.config.config_manager import get_config_manager
+        t = get_config_manager().get("xhs.timeout", 15)
+        return float(t) if t else 15.0
+    except Exception:
+        return 15.0
+
+
+def _make_opener(proxy: str) -> urllib.request.OpenerDirector:
+    """创建带代理（或明确禁用系统代理）的 opener"""
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    else:
+        # 空字典 = 禁用系统代理，避免意外使用系统级代理
+        handler = urllib.request.ProxyHandler({})
+    return urllib.request.build_opener(handler)
 
 
 def extract_url_content(url: str) -> dict:
@@ -77,10 +122,7 @@ def _is_valid_topic(topic: str) -> bool:
     if topic_lower in _BAD_TOPICS:
         return False
     # 纯标点符号
-    if not re.search(r"[\u4e00-\u9fff a-zA-Z0-9]", topic):
-        return False
-    # 太短或只是域名片段
-    if len(topic_lower) < 3:
+    if not re.search(r"[一-鿿 a-zA-Z0-9]", topic):
         return False
     return True
 
@@ -181,14 +223,17 @@ def _extract_summary(content: str) -> str:
 
 
 def _fetch_jina(url: str) -> dict:
-    """用 Jina Reader API 抓取网页"""
+    """用 Jina Reader API 抓取网页（支持代理）"""
+    proxy = _get_proxy()
+    timeout = _get_timeout()
     try:
         api_url = f"https://r.jina.ai/{url}"
         req = urllib.request.Request(api_url, headers={
             "User-Agent": "Mozilla/5.0",
             "Accept": "text/plain",
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        opener = _make_opener(proxy)
+        with opener.open(req, timeout=timeout) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
 
         topic = _extract_best_title(content)
@@ -207,7 +252,9 @@ def _fetch_jina(url: str) -> dict:
 
 
 def _fetch_direct(url: str) -> dict:
-    """直接抓取网页内容"""
+    """直接抓取网页内容（支持代理）"""
+    proxy = _get_proxy()
+    timeout = _get_timeout()
     try:
         req = urllib.request.Request(
             url,
@@ -217,7 +264,8 @@ def _fetch_direct(url: str) -> dict:
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        opener = _make_opener(proxy)
+        with opener.open(req, timeout=timeout) as resp:
             content_bytes = resp.read()
             # 尝试检测编码
             encoding = "utf-8"
