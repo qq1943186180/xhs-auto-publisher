@@ -18,8 +18,9 @@
         # 下载图片
         await collector.download_all_images(products)
 
-        # 导出数据
+        # 导出数据（完整 + 简化）
         collector.export_json(products)
+        collector.export_simple(products)
 """
 
 import asyncio
