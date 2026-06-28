@@ -111,34 +111,46 @@ class TaskListPage(QWidget):
         用于 local_images 为空时，直接从图片 URL 加载
         """
         try:
-            logger.info("正在从URL加载图片: %s", url[:80])
-            # 小红书CDN需要Cookie，尝试带Cookie请求
-            cookies = TaskListPage._get_xhs_cookies()
+            # 尝试获取高清版本：将 w/140 改为 w/1080
+            hd_url = url
+            if "w/140" in url:
+                hd_url = url.replace("w/140", "w/1080")
+                logger.info("使用高清URL: %s", hd_url[:80])
+            
+            logger.info("正在从URL加载图片: %s", hd_url[:80])
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Referer": "https://www.xiaohongshu.com/",
             }
-            resp = requests.get(url, timeout=15, headers=headers, cookies=cookies)
-            logger.info("URL加载响应: status=%s, content_length=%s", resp.status_code, len(resp.content))
             
-            if resp.status_code == 200 and len(resp.content) > 10000:
-                pil_img = PILImage.open(io.BytesIO(resp.content))
-                if pil_img.mode in ('RGBA', 'P', 'LA', 'L'):
-                    pil_img = pil_img.convert('RGB')
-                buf = io.BytesIO()
-                pil_img.save(buf, format='JPEG', quality=95)
-                buf.seek(0)
-                qimg = QImage()
-                qimg.loadFromData(buf.getvalue())
-                if not qimg.isNull():
-                    logger.info("URL加载成功: %s", url[:50])
-                    return QPixmap.fromImage(qimg).scaled(
-                        width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                    )
-                else:
-                    logger.warning("URL加载失败: QImage.isNull=True, %s", url[:50])
-            else:
-                logger.warning("URL加载失败: status=%s, size=%s, %s", resp.status_code, len(resp.content), url[:50])
+            # 先尝试高清URL，失败则用原始URL
+            for try_url in [hd_url, url]:
+                try:
+                    resp = requests.get(try_url, timeout=15, headers=headers)
+                    logger.info("URL加载响应: status=%s, content_length=%s, url=%s",
+                               resp.status_code, len(resp.content), try_url[:60])
+                    
+                    if resp.status_code == 200 and len(resp.content) > 500:
+                        pil_img = PILImage.open(io.BytesIO(resp.content))
+                        if pil_img.mode in ('RGBA', 'P', 'LA', 'L'):
+                            pil_img = pil_img.convert('RGB')
+                        buf = io.BytesIO()
+                        pil_img.save(buf, format='JPEG', quality=95)
+                        buf.seek(0)
+                        qimg = QImage()
+                        qimg.loadFromData(buf.getvalue())
+                        if not qimg.isNull():
+                            logger.info("URL加载成功: %s", try_url[:50])
+                            return QPixmap.fromImage(qimg).scaled(
+                                width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                            )
+                        else:
+                            logger.warning("QImage.isNull=True: %s", try_url[:50])
+                except Exception as e:
+                    logger.warning("尝试URL失败: %s (%s)", try_url[:50], e)
+                    continue
+            
+            logger.warning("所有URL尝试均失败")
         except Exception as e:
             logger.warning("URL 图片加载失败: %s (%s)", url[:50], e)
         return None

@@ -671,14 +671,18 @@ class QianfanCollector:
                 success = await self._download_image(url, local_path)
                 if success:
                     # 验证并转换图片（WEBP->JPG）
+                    logger.info("下载成功，验证图片: %s", url[:80])
                     final_path = self._validate_and_convert_image(local_path)
                     if final_path:
                         product.local_images.append(final_path)
                         self._downloaded.add(url)
                         self._save_progress()
                         downloaded += 1
+                        logger.info("图片验证通过: %s -> %s", url[:50], final_path)
                     else:
-                        logger.warning("下载的图片无效: %s", url)
+                        logger.warning("下载的图片无效或太小: %s", url)
+                else:
+                    logger.warning("下载失败（_download_image返回False）: %s", url)
                 await AntiDetect.human_like_delay(0.3, 1.0)
 
         logger.info("图片下载完成：下载 %s 张，跳过 %s 张", downloaded, skipped)
