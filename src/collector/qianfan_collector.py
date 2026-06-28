@@ -219,12 +219,27 @@ class QianfanCollector:
             logger.warning("未找到商品列表元素，可能需要更新选择器")
             # 截图保存以便调试
             await self._debug_screenshot("no_goods_found")
+            # 保存页面HTML用于调试
+            try:
+                html = await self.page.content()
+                debug_html = os.path.join(self.output_dir, "debug", f"page_{int(time.time())}.html")
+                os.makedirs(os.path.dirname(debug_html), exist_ok=True)
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(html)
+                logger.info("页面HTML已保存: %s", debug_html)
+            except Exception:
+                pass
             return products
 
         for item_el in goods_items:
             try:
                 product = await self._parse_product_item(item_el)
                 if product and product.name:
+                    # 调试日志：输出每个商品的图片URL
+                    logger.info(
+                        "采集商品: name=%s, item_id=%s, main_images=%s",
+                        product.name[:20], product.item_id, product.main_images[:2]
+                    )
                     products.append(product)
             except Exception as e:
                 logger.error("解析商品项出错: %s", e)
@@ -398,25 +413,86 @@ class QianfanCollector:
         return ""
 
     async def _extract_image_urls(self, element) -> List[str]:
-        """提取商品图片 URL"""
+        """提取商品图片 URL（多种策略）"""
         urls = []
+
+        # 策略1: img 标签的 src/data-src
         imgs = await element.query_selector_all('img')
         for img in imgs:
-            src = await img.get_attribute("src")
-            if not src:
-                src = await img.get_attribute("data-src")
-            if not src:
-                src = await img.get_attribute("data-lazy-src")
+            for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+                src = await img.get_attribute(attr)
+                if src:
+                    break
             if src:
-                # 补全相对 URL
-                if src.startswith("//"):
-                    src = "https:" + src
-                elif src.startswith("/"):
-                    src = urljoin(self.BASE_URL, src)
-                # 过滤掉图标、占位图等
-                if self._is_product_image(src) and src not in urls:
+                src = self._normalize_url(src)
+                if src and self._is_product_image(src) and src not in urls:
                     urls.append(src)
+
+        # 策略2: 背景图 (background-image)
+        try:
+            bg_elements = await element.query_selector_all('[style*="background"], [style*="background-image"]')
+            for el in bg_elements:
+                style = await el.get_attribute("style")
+                if style:
+                    import re as _re
+                    bg_match = _re.search(r'background-image:\s*url\(["\']?([^"\')]+)["\']?\)', style)
+                    if bg_match:
+                        src = bg_match.group(1)
+                        src = self._normalize_url(src)
+                        if src and self._is_product_image(src) and src not in urls:
+                            urls.append(src)
+        except Exception:
+            pass
+
+        # 策略3: 从元素的 data-* 属性提取
+        try:
+            for attr in ("data-img", "data-image", "data-src", "data-cover"):
+                els = await element.query_selector_all(f'[{attr}]')
+                for el in els:
+                    src = await el.get_attribute(attr)
+                    if src:
+                        src = self._normalize_url(src)
+                        if src and self._is_product_image(src) and src not in urls:
+                            urls.append(src)
+        except Exception:
+            pass
+
+        # 策略4: 直接 evaluate 从元素HTML中正则提取图片URL
+        try:
+            html = await element.evaluate("el => el.innerHTML")
+            if html:
+                import re as _re
+                # 匹配 qimg.xiaohongshu.com 的URL（真正的商品图）
+                qimg_urls = _re.findall(
+                    r'https?://qimg\.xiaohongshu\.com/[^\s"\'<>\\]+',
+                    html
+                )
+                for u in qimg_urls:
+                    u = u.rstrip('\\/').strip()
+                    if u not in urls:
+                        urls.append(u)
+        except Exception:
+            pass
+
         return urls
+
+    def _normalize_url(self, src: str) -> str:
+        """补全和清理 URL"""
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = urljoin(self.BASE_URL, src)
+        # 修复重复的 query 参数（如 ?sign=xxx?sign=xxx）
+        if src.count("?") > 1:
+            # 只保留第一个 ? 后的内容
+            parts = src.split("?", 1)
+            base = parts[0]
+            query = parts[1]
+            # 如果query里还有?，截断
+            if "?" in query:
+                query = query.split("?")[0]
+            src = f"{base}?{query}"
+        return src
 
     def _product_image_urls(self, product: Product) -> List[tuple[str, str]]:
         """Return de-duplicated image URLs, main images first, capped per product."""
@@ -438,19 +514,25 @@ class QianfanCollector:
     @staticmethod
     def _is_product_image(url: str) -> bool:
         """判断是否为商品图片（排除图标、logo 等）"""
+        url_lower = url.lower()
+
         # 排除明显的非商品图
         exclude_patterns = [
             "logo", "icon", "avatar", "emoji", "loading",
             "placeholder", "default", "empty", "arrow",
             "favicon", "badge",
         ]
-        url_lower = url.lower()
         for pat in exclude_patterns:
             if pat in url_lower:
                 return False
 
+        # 排除 ci.xiaohongshu.com 域名的占位图（签名URL，通常是默认图）
+        # 这些URL格式: ci.xiaohongshu.com/xxx@r_640w_640h.jpg?sign=xxx
+        if "ci.xiaohongshu.com" in url_lower and "sign=" in url_lower:
+            logger.debug("排除ci占位图: %s", url[:60])
+            return False
+
         # 图片尺寸通常较大，排除太小的
-        # 有些 CDN URL 包含尺寸信息，如 @100w_100h
         size_match = re.search(r'@(\d+)w_(\d+)h', url)
         if size_match:
             w, h = int(size_match.group(1)), int(size_match.group(2))
