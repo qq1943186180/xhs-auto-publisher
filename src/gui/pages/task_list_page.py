@@ -6,10 +6,12 @@ import os
 import subprocess
 import sys
 import logging
+import requests
 from pathlib import Path
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QWidget, QLabel, QTableWidgetItem, QFrame, QMessageBox
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QByteArray, QBuffer
 from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PIL import Image as PILImage
 import io
 
@@ -82,6 +84,33 @@ class TaskListPage(QWidget):
                 )
         except Exception as e:
             logger.warning("Pillow 加载失败: %s (%s)", img_path, e)
+        return None
+
+    @staticmethod
+    def _load_image_from_url(url: str, width: int, height: int):
+        """
+        从 URL 加载图片并返回缩放后的 QPixmap
+        用于 local_images 为空时，直接从图片 URL 加载
+        """
+        try:
+            resp = requests.get(url, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            if resp.status_code == 200:
+                pil_img = PILImage.open(io.BytesIO(resp.content))
+                if pil_img.mode in ('RGBA', 'P', 'LA', 'L'):
+                    pil_img = pil_img.convert('RGB')
+                buf = io.BytesIO()
+                pil_img.save(buf, format='JPEG', quality=95)
+                buf.seek(0)
+                qimg = QImage()
+                qimg.loadFromData(buf.getvalue())
+                if not qimg.isNull():
+                    return QPixmap.fromImage(qimg).scaled(
+                        width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+        except Exception as e:
+            logger.warning("URL 图片加载失败: %s (%s)", url[:50], e)
         return None
 
     def __init__(self, parent=None):
@@ -345,6 +374,16 @@ class TaskListPage(QWidget):
                                         img_loaded = True
                                         img_label.setToolTip(f"已采集 {len(found)} 张 (兜底)")
                                         break
+            if not img_loaded:
+                # 兜底2：从 main_images URL 直接加载（不需要本地文件）
+                main_imgs = p.get("main_images", [])
+                for url in main_imgs[:1]:
+                    pixmap = self._load_image_from_url(url, 48, 48)
+                    if pixmap:
+                        img_label.setPixmap(pixmap)
+                        img_loaded = True
+                        img_label.setToolTip(f"已采集 {len(main_imgs)} 张 (在线)")
+                        break
             if not img_loaded:
                 img_label.setText("无图")
                 img_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
