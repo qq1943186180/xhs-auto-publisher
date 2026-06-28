@@ -33,8 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-import aiohttp
-
 from .anti_detect import AntiDetect
 from .browser_manager import BrowserManager
 
@@ -629,7 +627,7 @@ class QianfanCollector:
 
         Args:
             products: 商品列表
-            concurrency: 并发下载数
+            concurrency: 并发下载数（保留参数兼容性，实际串行下载）
         """
         os.makedirs(self.output_dir, exist_ok=True)
         self._load_progress()
@@ -640,89 +638,81 @@ class QianfanCollector:
 
         logger.info("开始下载图片，共 %s 张，已有进度 %s 张", total, len(self._downloaded))
 
-        # 从浏览器 Context 提取 Cookie，传给 aiohttp（小红书 CDN 需要登录态）
-        cookie_dict = {}
-        if self._browser and self._browser.context:
-            try:
-                cookies = await self._browser.context.cookies()
-                for c in cookies:
-                    cookie_dict[c["name"]] = c["value"]
-                logger.info("已提取 %s 个 Cookie 用于图片下载", len(cookie_dict))
-            except Exception as e:
-                logger.warning("提取 Cookie 失败: %s", e)
+        # 使用浏览器 Context 下载（自动带登录态 Cookie）
+        for product in products:
+            product_dir = self._get_product_dir(product)
+            os.makedirs(product_dir, exist_ok=True)
 
-        connector = aiohttp.TCPConnector(limit=concurrency)
-        async with aiohttp.ClientSession(
-            connector=connector,
-            cookies=cookie_dict or None,
-        ) as session:
-            for product in products:
-                product_dir = self._get_product_dir(product)
-                os.makedirs(product_dir, exist_ok=True)
+            image_urls = self._product_image_urls(product)
+            product.local_images = []
+            kind_counts = {"main": 0, "detail": 0}
 
-                image_urls = self._product_image_urls(product)
-                product.local_images = []
-                kind_counts = {"main": 0, "detail": 0}
-
-                # 主图优先，详情图补足，每个产品最多 images_per_product 张
-                for kind, url in image_urls:
-                    kind_counts[kind] += 1
-                    local_path = os.path.join(
-                        product_dir,
-                        f"{kind}_{kind_counts[kind]}{self._guess_ext(url)}",
-                    )
-                    if url in self._downloaded:
-                        # 已下载，检查本地文件是否存在
-                        if os.path.exists(local_path):
-                            # 验证并转换图片（WEBP->JPG）
-                            final_path = self._validate_and_convert_image(local_path)
-                            if final_path:
-                                product.local_images.append(final_path)
-                                skipped += 1
-                            else:
-                                # 图片无效，重新下载
-                                self._downloaded.discard(url)
-                                logger.info("图片无效，重新下载: %s", url)
-                                continue
-                    success = await self._download_image(session, url, local_path)
-                    if success:
+            # 主图优先，详情图补足，每个产品最多 images_per_product 张
+            for kind, url in image_urls:
+                kind_counts[kind] += 1
+                local_path = os.path.join(
+                    product_dir,
+                    f"{kind}_{kind_counts[kind]}{self._guess_ext(url)}",
+                )
+                if url in self._downloaded:
+                    # 已下载，检查本地文件是否存在
+                    if os.path.exists(local_path):
                         # 验证并转换图片（WEBP->JPG）
                         final_path = self._validate_and_convert_image(local_path)
                         if final_path:
                             product.local_images.append(final_path)
-                            self._downloaded.add(url)
-                            self._save_progress()
-                            downloaded += 1
+                            skipped += 1
                         else:
-                            logger.warning("下载的图片无效: %s", url)
-                    await AntiDetect.human_like_delay(0.3, 1.0)
+                            # 图片无效，重新下载
+                            self._downloaded.discard(url)
+                            logger.info("图片无效，重新下载: %s", url)
+                            continue
+                success = await self._download_image(url, local_path)
+                if success:
+                    # 验证并转换图片（WEBP->JPG）
+                    final_path = self._validate_and_convert_image(local_path)
+                    if final_path:
+                        product.local_images.append(final_path)
+                        self._downloaded.add(url)
+                        self._save_progress()
+                        downloaded += 1
+                    else:
+                        logger.warning("下载的图片无效: %s", url)
+                await AntiDetect.human_like_delay(0.3, 1.0)
 
         logger.info("图片下载完成：下载 %s 张，跳过 %s 张", downloaded, skipped)
 
     async def _download_image(
         self,
-        session: aiohttp.ClientSession,
         url: str,
         local_path: str,
         retries: int = 3,
     ) -> bool:
-        """下载单张图片（带重试）"""
-        headers = {
-            "User-Agent": AntiDetect.random_user_agent(),
-            "Referer": self.BASE_URL,
-        }
-
+        """
+        下载单张图片（带重试）
+        使用浏览器 Context 发起请求（带完整登录态 Cookie）
+        """
         for attempt in range(retries):
             try:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        with open(local_path, "wb") as f:
-                            f.write(data)
-                        logger.debug("已下载: %s (%s bytes)", os.path.basename(local_path), len(data))
-                        return True
-                    else:
-                        logger.warning("下载失败 (HTTP %s): %s", resp.status, url)
+                # 用浏览器 Context 发起请求（自动带 Cookie）
+                resp = await self._browser.context.request.get(
+                    url,
+                    headers={
+                        "User-Agent": AntiDetect.random_user_agent(),
+                        "Referer": self.BASE_URL,
+                    },
+                    timeout=30000,
+                )
+                if resp.status == 200:
+                    data = await resp.body()
+                    with open(local_path, "wb") as f:
+                        f.write(data)
+                    logger.debug("已下载: %s (%s bytes)", os.path.basename(local_path), len(data))
+                    await resp.dispose()
+                    return True
+                else:
+                    logger.warning("下载失败 (HTTP %s): %s", resp.status, url)
+                    await resp.dispose()
             except Exception as e:
                 logger.warning("下载出错 (尝试 %s/%s): %s", attempt+1, retries, e)
                 if attempt < retries - 1:
