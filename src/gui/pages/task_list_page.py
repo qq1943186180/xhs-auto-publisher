@@ -281,8 +281,12 @@ class TaskListPage(QWidget):
             img_label = QLabel()
             img_label.setAlignment(Qt.AlignCenter)
             img_label.setFixedSize(52, 52)
+            img_label.setStyleSheet("border: 1px solid #e5e7eb; border-radius: 4px;")
             local_imgs = p.get("local_images", [])
-            existing_imgs = [img for img in local_imgs if os.path.exists(img)]
+            existing_imgs = []
+            for img in local_imgs:
+                if os.path.exists(img) and os.path.getsize(img) > 10000:  # 有效图片至少 10KB
+                    existing_imgs.append(img)
             img_loaded = False
             if existing_imgs:
                 img_path = existing_imgs[0]
