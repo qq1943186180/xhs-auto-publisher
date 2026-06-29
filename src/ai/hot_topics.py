@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from src.utils.logger import get_logger
@@ -29,27 +30,40 @@ def fetch_hot_topics(source: str = "全部") -> list:
     并行获取热点主题列表
     返回: [{"title": ..., "description": ..., "source": ..., "rank": ...}, ...]
     """
-    tasks = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        if source in ("全部", "微博"):
-            tasks["微博"] = pool.submit(_fetch_weibo)
-        if source in ("全部", "百度"):
-            tasks["百度"] = pool.submit(_fetch_baidu)
-        # 知乎需要登录 Cookie，仅在明确选择时才请求
-        if source == "知乎":
-            tasks["知乎"] = pool.submit(_fetch_zhihu)
+    fetchers = []
+    if source in ("全部", "微博"):
+        fetchers.append(("微博", _fetch_weibo))
+    if source in ("全部", "百度"):
+        fetchers.append(("百度", _fetch_baidu))
+    if source == "知乎":
+        fetchers.append(("知乎", _fetch_zhihu))
 
-        results = []
-        for name, future in tasks.items():
-            try:
-                items = future.result(timeout=_TIMEOUT + 3)
-                results.extend(items)
-                logger.info("%s 热点: %d 条", name, len(items))
-            except TimeoutError:
-                logger.warning("%s 热点请求超时，已跳过", name)
-                future.cancel()
-            except Exception as e:
-                logger.warning("%s 热点获取失败: %s", name, e)
+    # 用 daemon 线程并行抓取，进程退出时自动清理不阻塞
+    bucket = {}
+
+    def _run(name, fn):
+        try:
+            bucket[name] = fn()
+        except Exception as e:
+            logger.warning("%s 热点获取失败: %s", name, e)
+            bucket[name] = []
+
+    threads = []
+    for name, fn in fetchers:
+        t = threading.Thread(target=_run, args=(name, fn), daemon=True)
+        t.start()
+        threads.append((name, t))
+
+    # 等待所有线程，最多 _TIMEOUT + 3 秒
+    deadline = _TIMEOUT + 3
+    for name, t in threads:
+        t.join(timeout=deadline)
+        if t.is_alive():
+            logger.warning("%s 热点请求超时，已跳过", name)
+
+    results = []
+    for name, _ in fetchers:
+        results.extend(bucket.get(name, []))
 
     # 按来源分组排序：微博 → 百度 → 知乎
     order = {"微博": 0, "百度": 1, "知乎": 2}
