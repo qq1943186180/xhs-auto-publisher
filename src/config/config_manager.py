@@ -53,6 +53,9 @@ DEFAULT_CONFIG = {
         "console_output": True,
     },
     "prompts": {},
+    "search": {
+        "serper_key": "",
+    },
 }
 
 
@@ -63,6 +66,7 @@ ENV_OVERRIDES = {
     "XHS_MAX_DAILY_POSTS": "publish.max_daily_posts",
     "XHS_LOG_LEVEL": "log.level",
     "XHS_NOTIFICATION_WEBHOOK_URL": "notification.webhook_url",
+    "SERPER_API_KEY": "search.serper_key",
 }
 
 
