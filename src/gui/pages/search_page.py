@@ -49,7 +49,7 @@ class SearchPage(QWidget):
 
         subtitle = QLabel(
             "搜索相关资料，用于生成更优质的文案"
-            "（配置 SERPER_API_KEY 可获得最佳谷歌搜索结果）"
+            "（配置 TAVILY_API_KEY 或 SERPER_API_KEY 可获得真实搜索结果）"
         )
         subtitle.setStyleSheet(page_subtitle_style())
         subtitle.setWordWrap(True)
@@ -85,8 +85,8 @@ class SearchPage(QWidget):
         online_layout.addWidget(self.keyword_edit)
 
         api_hint = QLabel(
-            "💡 配置 <b>SERPER_API_KEY</b> 环境变量可启用谷歌搜索"
-            "（serper.dev 免费 2500 次/月）"
+            "💡 配置 <b>TAVILY_API_KEY</b>（tavily.com，免费 1000 次/月）"
+            " 或 <b>SERPER_API_KEY</b>（serper.dev，免费 2500 次/月）可获得真实搜索结果"
         )
         api_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         api_hint.setWordWrap(True)
@@ -194,12 +194,14 @@ class SearchPage(QWidget):
                 "未找到相关结果。",
                 "",
                 "💡 提升搜索质量的方法：",
-                "  1. 配置 Serper API Key（谷歌结果质量最佳）：",
+                "  1. 配置 Tavily API Key（AI 搜索，免费 1000 次/月）：",
+                "     设置环境变量 TAVILY_API_KEY=你的key",
+                "     免费申请：https://tavily.com",
+                "  2. 配置 Serper API Key（谷歌结果，免费 2500 次/月）：",
                 "     设置环境变量 SERPER_API_KEY=你的key",
-                "     或在配置文件中设置 search.serper_key",
                 "     免费申请：https://serper.dev",
-                "  2. 配置代理后 Jina 搜索可用（设置 xhs.proxy）",
-                "  3. 也可切换到「手动输入」标签页粘贴参考资料",
+                "  3. 配置代理后 Jina 搜索可用（设置 xhs.proxy）",
+                "  4. 也可切换到「手动输入」标签页粘贴参考资料",
             ]
             if error:
                 hint_lines.insert(0, f"搜索出错：{error}")
