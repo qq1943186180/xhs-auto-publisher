@@ -1,9 +1,9 @@
 """
-搜索工具集成 - 生成前自动搜索相关资料
-使用 Jina s.jina.ai 搜索端点（正确用法，参考 jina-ai/reader GitHub）
+搜索工具集成 - 多后端：Serper.dev / Jina / DuckDuckGo
+优先使用已配置的 API Key，降级免费接口
 """
 import json
-import logging
+import os
 import urllib.request
 import urllib.parse
 import threading
@@ -13,106 +13,203 @@ from src.utils.logger import get_logger
 logger = get_logger("search_integration")
 
 
-def search_web(query: str, max_results: int = 5) -> list:
-    """
-    使用 Jina s.jina.ai 搜索相关资料
-    返回: [{"title": ..., "content": ..., "url": ...}, ...]
-    """
-    if not query:
-        return []
+def _get_proxy() -> str:
+    proxy = (
+        os.environ.get("XHS_PROXY") or
+        os.environ.get("HTTPS_PROXY") or
+        os.environ.get("HTTP_PROXY") or
+        ""
+    )
+    if not proxy:
+        try:
+            from src.config.config_manager import get_config_manager
+            proxy = get_config_manager().get("xhs.proxy", "") or ""
+        except Exception:
+            pass
+    return proxy.strip()
+
+
+def _get_timeout() -> int:
+    try:
+        from src.config.config_manager import get_config_manager
+        t = get_config_manager().get("xhs.timeout", 15)
+        return int(t) if t else 15
+    except Exception:
+        return 15
+
+
+def _make_opener(proxy: str):
+    handler = urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {}
+    )
+    return urllib.request.build_opener(handler)
+
+
+def _get_serper_key() -> str:
+    key = os.environ.get("SERPER_API_KEY", "")
+    if not key:
+        try:
+            from src.config.config_manager import get_config_manager
+            key = get_config_manager().get("search.serper_key", "") or ""
+        except Exception:
+            pass
+    return key.strip()
+
+
+def _search_serper(query: str, max_results: int, proxy: str, timeout: int) -> list:
+    """Serper.dev Google 搜索（需 API Key，免费 2500 次/月）"""
+    api_key = _get_serper_key()
+    if not api_key:
+        raise ValueError("未配置 SERPER_API_KEY")
+
+    payload = json.dumps({
+        "q": query,
+        "num": max_results,
+        "gl": "cn",
+        "hl": "zh-cn",
+    }).encode()
+    req = urllib.request.Request(
+        "https://google.serper.dev/search",
+        data=payload,
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = _make_opener(proxy)
+    with opener.open(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
 
     results = []
+    for item in data.get("organic", [])[:max_results]:
+        results.append({
+            "title": item.get("title", "")[:80],
+            "content": item.get("snippet", "")[:500],
+            "url": item.get("link", ""),
+        })
+    if not results:
+        raise ValueError("Serper 返回空结果")
+    return results
 
-    # 正确用法：s.jina.ai/<URL编码后的搜索关键词>
-    # 参考：https://github.com/jina-ai/reader
-    try:
-        encoded = urllib.parse.quote(query)
-        jina_url = f"https://s.jina.ai/{encoded}"
 
-        req = urllib.request.Request(
-            jina_url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+def _search_jina(query: str, max_results: int, proxy: str, timeout: int) -> list:
+    """Jina Reader 搜索（s.jina.ai，无需 Key，国内需代理）"""
+    encoded = urllib.parse.quote(query)
+    req = urllib.request.Request(
+        f"https://s.jina.ai/{encoded}",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
+    )
+    opener = _make_opener(proxy)
+    with opener.open(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
 
-        # s.jina.ai 返回 JSON 格式：
-        # { "query": "...", "results": [ { "title": "...", "url": "...", "content": "..." }, ... ] }
-        if isinstance(data, dict) and "results" in data:
-            raw_results = data["results"]
-        elif isinstance(data, list):
-            raw_results = data
-        else:
-            # 非 JSON 模式，按文本处理
-            raw_results = []
-
-        for item in raw_results[:max_results]:
+    raw = data.get("results", data if isinstance(data, list) else [])
+    results = []
+    for item in raw[:max_results]:
+        if isinstance(item, dict):
             results.append({
                 "title": item.get("title", "")[:80],
                 "content": item.get("content", "")[:500],
                 "url": item.get("url", ""),
             })
+    if not results:
+        raise ValueError("Jina 返回空结果")
+    return results
 
-        if results:
-            logger.info("Jina 搜索获取 %d 条结果", len(results))
-            return results[:max_results]
 
-    except Exception as e:
-        logger.debug("Jina 搜索（JSON）失败，尝试文本模式: %s", e)
+def _search_duckduckgo(query: str, max_results: int, proxy: str, timeout: int) -> list:
+    """DuckDuckGo 即时答案 API（无需 Key）"""
+    params = urllib.parse.urlencode({
+        "q": query,
+        "format": "json",
+        "no_html": "1",
+        "skip_disambig": "1",
+    })
+    req = urllib.request.Request(
+        f"https://api.duckduckgo.com/?{params}",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    opener = _make_opener(proxy)
+    with opener.open(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
 
-    # 降级：不用 Accept: application/json，直接读文本结果
-    try:
-        encoded = urllib.parse.quote(query)
-        jina_url = f"https://s.jina.ai/{encoded}"
-
-        req = urllib.request.Request(
-            jina_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            content = resp.read().decode("utf-8", errors="ignore")
-
-        # 文本模式：按行解析，提取标题和内容
-        lines = [l.strip() for l in content.splitlines() if l.strip()]
-        title = ""
-        snippet = ""
-        for line in lines:
-            if line.startswith("# ") and not title:
-                title = line[2:].strip()
-            elif len(line) > 30 and not line.startswith("#") and not line.startswith(">") and not line.startswith("["):
-                snippet = line
-                break
-
-        if title or snippet:
+    results = []
+    if data.get("AbstractText"):
+        results.append({
+            "title": data.get("Heading", query)[:80],
+            "content": data["AbstractText"][:500],
+            "url": data.get("AbstractURL", ""),
+        })
+    for topic in data.get("RelatedTopics", [])[:max_results]:
+        if isinstance(topic, dict) and topic.get("Text"):
             results.append({
-                "title": title or f"搜索：{query}",
-                "content": snippet[:500],
-                "url": "",
+                "title": topic.get("Text", "")[:80],
+                "content": topic.get("Text", "")[:500],
+                "url": topic.get("FirstURL", ""),
             })
-            logger.info("Jina 搜索（文本模式）获取结果")
+        if len(results) >= max_results:
+            break
+    if not results:
+        raise ValueError("DuckDuckGo 返回空结果")
+    return results[:max_results]
+
+
+def search_web(query: str, max_results: int = 5) -> list:
+    """
+    多后端搜索，按优先级依次尝试：
+    1. Serper.dev（配置 SERPER_API_KEY 时，谷歌结果质量最佳）
+    2. Jina s.jina.ai（有代理效果好，无代理也尝试）
+    3. DuckDuckGo 即时答案（免费，无需 Key）
+    4. 关键词提示（兜底）
+    """
+    if not query:
+        return []
+
+    proxy = _get_proxy()
+    timeout = min(_get_timeout(), 20)
+
+    # 1. Serper（最优质，需 key）
+    if _get_serper_key():
+        try:
+            results = _search_serper(query, max_results, proxy, timeout)
+            logger.info("Serper 搜索成功: %d 条", len(results))
             return results
+        except Exception as e:
+            logger.warning("Serper 搜索失败: %s", e)
 
+    # 2. Jina（有代理效果好，无代理也试一次）
+    try:
+        results = _search_jina(query, max_results, proxy, timeout)
+        logger.info("Jina 搜索成功: %d 条", len(results))
+        return results
     except Exception as e:
-        logger.debug("Jina 搜索（文本模式）也失败: %s", e)
+        logger.debug("Jina 搜索失败: %s", e)
 
-    # 最终降级：直接基于 query 生成参考文本
-    logger.info("搜索降级：直接使用关键词「%s」作为参考资料", query)
+    # 3. DuckDuckGo（免费兜底）
+    try:
+        results = _search_duckduckgo(query, max_results, proxy, timeout)
+        logger.info("DuckDuckGo 搜索成功: %d 条", len(results))
+        return results
+    except Exception as e:
+        logger.debug("DuckDuckGo 搜索失败: %s", e)
+
+    # 4. 关键词兜底
+    logger.info("搜索降级为关键词提示：「%s」", query)
     return [{
         "title": f"主题：{query}",
-        "content": f"请根据「{query}」这个主题，生成一篇有深度、有见解的小红书种草文案。可以从以下角度展开：背景介绍、核心特点、使用体验、搭配建议、购买推荐。",
-        "url": ""
+        "content": (
+            f"请根据「{query}」这个主题，生成一篇有深度的小红书种草文案。"
+            "可从以下角度展开：背景介绍、核心特点、使用体验、搭配建议、购买推荐。"
+        ),
+        "url": "",
     }]
 
 
 def format_search_results_for_prompt(results: list) -> str:
-    """将搜索结果格式化为 prompt 文本"""
     if not results:
         return ""
-
-    parts = ["\n\n# 参考资料（搜索结果）\n"]
+    parts = ["# 参考资料（搜索结果）\n"]
     for i, r in enumerate(results, 1):
         title = r.get("title", f"资料 {i}")
         content = r.get("content", "")[:400]
@@ -123,28 +220,27 @@ def format_search_results_for_prompt(results: list) -> str:
                 parts.append(f"   来源：{url}")
         elif title:
             parts.append(f"{i}. **{title}**")
-
     return "\n".join(parts)
 
 
 class SearchWorker(threading.Thread):
-    """后台搜索线程"""
+    """后台搜索线程，完成后通过 QTimer 在主线程回调"""
 
     def __init__(self, query: str, callback=None):
         super().__init__(daemon=True)
         self.query = query
         self.callback = callback
         self.results = []
+        self.error = None
 
     def run(self):
         try:
             self.results = search_web(self.query)
-            if self.callback:
-                # 在主线程回调
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self.callback(self.results))
         except Exception as e:
-            logger.error("Search worker failed: %s", e)
-            if self.callback:
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self.callback([]))
+            logger.error("SearchWorker failed: %s", e)
+            self.error = str(e)
+            self.results = []
+
+        if self.callback:
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.callback(self.results, self.error))
