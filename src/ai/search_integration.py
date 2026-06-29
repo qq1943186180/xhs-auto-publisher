@@ -1,5 +1,5 @@
 """
-搜索工具集成 - 多后端：Serper.dev / Jina / DuckDuckGo
+搜索工具集成 - 多后端：Tavily / Serper.dev / Jina / DuckDuckGo
 优先使用已配置的 API Key，降级免费接口
 """
 import json
@@ -43,6 +43,52 @@ def _make_opener(proxy: str):
         {"http": proxy, "https": proxy} if proxy else {}
     )
     return urllib.request.build_opener(handler)
+
+
+def _get_tavily_key() -> str:
+    key = os.environ.get("TAVILY_API_KEY", "")
+    if not key:
+        try:
+            from src.config.config_manager import get_config_manager
+            key = get_config_manager().get("search.tavily_key", "") or ""
+        except Exception:
+            pass
+    return key.strip()
+
+
+def _search_tavily(query: str, max_results: int, proxy: str, timeout: int) -> list:
+    """Tavily AI 搜索（需 API Key，免费 1000 次/月，专为 AI 应用设计）"""
+    api_key = _get_tavily_key()
+    if not api_key:
+        raise ValueError("未配置 TAVILY_API_KEY")
+
+    payload = json.dumps({
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+        "include_answer": False,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = _make_opener(proxy)
+    with opener.open(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+
+    results = []
+    for item in data.get("results", [])[:max_results]:
+        results.append({
+            "title": item.get("title", "")[:80],
+            "content": item.get("content", "")[:500],
+            "url": item.get("url", ""),
+        })
+    if not results:
+        raise ValueError("Tavily 返回空结果")
+    return results
 
 
 def _get_serper_key() -> str:
@@ -158,10 +204,11 @@ def _search_duckduckgo(query: str, max_results: int, proxy: str, timeout: int) -
 def search_web(query: str, max_results: int = 5) -> list:
     """
     多后端搜索，按优先级依次尝试：
-    1. Serper.dev（配置 SERPER_API_KEY 时，谷歌结果质量最佳）
-    2. Jina s.jina.ai（有代理效果好，无代理也尝试）
-    3. DuckDuckGo 即时答案（免费，无需 Key）
-    4. 关键词提示（兜底）
+    1. Tavily（配置 TAVILY_API_KEY 时，AI 友好，免费 1000 次/月）
+    2. Serper.dev（配置 SERPER_API_KEY 时，谷歌结果质量最佳）
+    3. Jina s.jina.ai（有代理效果好，无代理也尝试）
+    4. DuckDuckGo 即时答案（免费，无需 Key）
+    5. 关键词提示（兜底）
     """
     if not query:
         return []
@@ -169,7 +216,16 @@ def search_web(query: str, max_results: int = 5) -> list:
     proxy = _get_proxy()
     timeout = min(_get_timeout(), 20)
 
-    # 1. Serper（最优质，需 key）
+    # 1. Tavily（AI 搜索，免费 1000 次/月）
+    if _get_tavily_key():
+        try:
+            results = _search_tavily(query, max_results, proxy, timeout)
+            logger.info("Tavily 搜索成功: %d 条", len(results))
+            return results
+        except Exception as e:
+            logger.warning("Tavily 搜索失败: %s", e)
+
+    # 2. Serper（谷歌质量，需 key）
     if _get_serper_key():
         try:
             results = _search_serper(query, max_results, proxy, timeout)
@@ -178,7 +234,7 @@ def search_web(query: str, max_results: int = 5) -> list:
         except Exception as e:
             logger.warning("Serper 搜索失败: %s", e)
 
-    # 2. Jina（有代理效果好，无代理也试一次）
+    # 3. Jina（有代理效果好，无代理也试一次）
     try:
         results = _search_jina(query, max_results, proxy, timeout)
         logger.info("Jina 搜索成功: %d 条", len(results))
@@ -186,7 +242,7 @@ def search_web(query: str, max_results: int = 5) -> list:
     except Exception as e:
         logger.debug("Jina 搜索失败: %s", e)
 
-    # 3. DuckDuckGo（免费兜底）
+    # 4. DuckDuckGo（免费兜底）
     try:
         results = _search_duckduckgo(query, max_results, proxy, timeout)
         logger.info("DuckDuckGo 搜索成功: %d 条", len(results))
@@ -194,7 +250,7 @@ def search_web(query: str, max_results: int = 5) -> list:
     except Exception as e:
         logger.debug("DuckDuckGo 搜索失败: %s", e)
 
-    # 4. 关键词兜底
+    # 5. 关键词兜底
     logger.info("搜索降级为关键词提示：「%s」", query)
     return [{
         "title": f"主题：{query}",
