@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     },
     "prompts": {},
     "search": {
+        "tavily_key": "",
         "serper_key": "",
     },
 }
@@ -66,6 +67,7 @@ ENV_OVERRIDES = {
     "XHS_MAX_DAILY_POSTS": "publish.max_daily_posts",
     "XHS_LOG_LEVEL": "log.level",
     "XHS_NOTIFICATION_WEBHOOK_URL": "notification.webhook_url",
+    "TAVILY_API_KEY": "search.tavily_key",
     "SERPER_API_KEY": "search.serper_key",
 }
 
