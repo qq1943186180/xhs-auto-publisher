@@ -2,21 +2,20 @@
 搜索工具集成页面
 搜索相关资料，用于生成更优质的文案
 """
-import logging
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
-    QGridLayout, QMessageBox, QPlainTextEdit, QPushButton, QTabWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPlainTextEdit, QTabWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal
 
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, PushButton, InfoBar,
-    LineEdit, TextEdit,
+    LineEdit,
 )
 from src.gui.styles.theme import (
-    BORDER, ERROR, PRIMARY, SUCCESS, SURFACE_ALT,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-    page_subtitle_style, page_title_style, placeholder_style,
+    BORDER, SURFACE_ALT,
+    TEXT_PRIMARY, TEXT_SECONDARY,
+    page_subtitle_style, page_title_style,
 )
 from src.gui.utils import PAGE_MARGINS
 from src.utils.logger import get_logger
@@ -26,12 +25,13 @@ logger = get_logger("gui.search_page")
 
 class SearchPage(QWidget):
     """搜索工具集成页面"""
-    search_completed = pyqtSignal(dict)  # 搜索完成，请求生成
-    generate_requested = pyqtSignal(dict)  # 请求生成内容
+    search_completed = pyqtSignal(dict)
+    generate_requested = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._search_results = []
+        self._worker = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -47,13 +47,17 @@ class SearchPage(QWidget):
         title.setStyleSheet(page_title_style())
         header.addWidget(title)
 
-        subtitle = QLabel("搜索相关资料，用于生成更优质的文案（支持 Jina 免费搜索 / 手动输入参考资料）")
+        subtitle = QLabel(
+            "搜索相关资料，用于生成更优质的文案"
+            "（配置 SERPER_API_KEY 可获得最佳谷歌搜索结果）"
+        )
         subtitle.setStyleSheet(page_subtitle_style())
+        subtitle.setWordWrap(True)
         header.addWidget(subtitle)
 
         layout.addLayout(header)
 
-        # Tab widget: 在线搜索 / 手动输入
+        # Tab widget
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(f"""
             QTabWidget::pane {{
@@ -77,7 +81,16 @@ class SearchPage(QWidget):
         self.keyword_edit = LineEdit()
         self.keyword_edit.setPlaceholderText("输入关键词，如：2024年配饰流行趋势")
         self.keyword_edit.setFixedHeight(36)
+        self.keyword_edit.returnPressed.connect(self._on_search)
         online_layout.addWidget(self.keyword_edit)
+
+        api_hint = QLabel(
+            "💡 配置 <b>SERPER_API_KEY</b> 环境变量可启用谷歌搜索"
+            "（serper.dev 免费 2500 次/月）"
+        )
+        api_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+        api_hint.setWordWrap(True)
+        online_layout.addWidget(api_hint)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -95,7 +108,6 @@ class SearchPage(QWidget):
 
         online_layout.addLayout(btn_layout)
 
-        # 搜索状态标签
         self.status_label = QLabel("")
         self.status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
         online_layout.addWidget(self.status_label)
@@ -103,18 +115,20 @@ class SearchPage(QWidget):
         online_layout.addStretch()
         self.tabs.addTab(online_tab, "🌐 在线搜索")
 
-        # Tab 2: 手动输入参考资料
+        # Tab 2: 手动输入
         manual_tab = QWidget()
         manual_layout = QVBoxLayout(manual_tab)
         manual_layout.setContentsMargins(0, 12, 0, 0)
         manual_layout.setSpacing(12)
 
-        manual_label = QLabel("手动输入参考资料（如果在线搜索不可用）：")
+        manual_label = QLabel("手动输入参考资料（在线搜索不可用时）：")
         manual_label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-weight: 600;")
         manual_layout.addWidget(manual_label)
 
         self.manual_edit = QPlainTextEdit()
-        self.manual_edit.setPlaceholderText("请粘贴或输入参考资料...\n\n例如：\n- 小红书配饰推荐：...\n- 2024年流行趋势：...")
+        self.manual_edit.setPlaceholderText(
+            "请粘贴或输入参考资料...\n\n例如：\n- 小红书配饰推荐：...\n- 2024年流行趋势：..."
+        )
         self.manual_edit.setFixedHeight(200)
         manual_layout.addWidget(self.manual_edit)
 
@@ -146,7 +160,7 @@ class SearchPage(QWidget):
         layout.addWidget(result_card)
 
     def _on_search(self):
-        """执行搜索"""
+        """执行搜索（异步，不阻塞 UI）"""
         keyword = self.keyword_edit.text().strip()
         if not keyword:
             InfoBar.warning("提示", "请输入搜索关键词", parent=self)
@@ -154,34 +168,46 @@ class SearchPage(QWidget):
 
         self.search_btn.setText("搜索中...")
         self.search_btn.setEnabled(False)
+        self.generate_btn.setEnabled(False)
         self.status_label.setText("正在搜索，请稍候...")
+        self.result_edit.setPlainText("正在搜索中，请稍候...")
 
-        try:
-            from src.ai.search_integration import search_web, format_search_results_for_prompt
-            results = search_web(keyword, max_results=5)
+        from src.ai.search_integration import SearchWorker
+        self._worker = SearchWorker(keyword, callback=self._on_search_done)
+        self._worker.start()
 
-            if results:
-                self._search_results = results
-                formatted = format_search_results_for_prompt(results)
-                self.result_edit.setPlainText(formatted)
-                self.generate_btn.setEnabled(True)
-                self.status_label.setText(f"✅ 找到 {len(results)} 条相关资料")
-                InfoBar.success("搜索成功", f"找到 {len(results)} 条相关资料", parent=self)
-            else:
-                self.result_edit.setPlainText("未找到相关结果，请尝试其他关键词，或使用「手动输入」标签页")
-                self.generate_btn.setEnabled(False)
-                self.status_label.setText("⚠️ 未找到相关结果")
-                InfoBar.warning("搜索失败", "未找到相关结果，请尝试其他关键词", parent=self)
+    def _on_search_done(self, results, error=None):
+        """搜索完成回调（由 QTimer 保证在主线程执行）"""
+        self.search_btn.setText("🔍 搜索")
+        self.search_btn.setEnabled(True)
 
-        except Exception as e:
-            logger.error("Search failed: %s", e)
-            self.result_edit.setPlainText(f"搜索失败：{e}\n\n建议：\n1. 检查网络连接\n2. 使用「手动输入」标签页手动粘贴参考资料")
-            self.status_label.setText(f"❌ 搜索失败：{e}")
-            InfoBar.error("搜索失败", str(e), parent=self)
-
-        finally:
-            self.search_btn.setText("🔍 搜索")
-            self.search_btn.setEnabled(True)
+        if results:
+            self._search_results = results
+            from src.ai.search_integration import format_search_results_for_prompt
+            formatted = format_search_results_for_prompt(results)
+            self.result_edit.setPlainText(formatted)
+            self.generate_btn.setEnabled(True)
+            self.status_label.setText(f"✅ 找到 {len(results)} 条相关资料")
+            InfoBar.success("搜索成功", f"找到 {len(results)} 条相关资料", parent=self)
+        else:
+            hint_lines = [
+                "未找到相关结果。",
+                "",
+                "💡 提升搜索质量的方法：",
+                "  1. 配置 Serper API Key（谷歌结果质量最佳）：",
+                "     设置环境变量 SERPER_API_KEY=你的key",
+                "     或在配置文件中设置 search.serper_key",
+                "     免费申请：https://serper.dev",
+                "  2. 配置代理后 Jina 搜索可用（设置 xhs.proxy）",
+                "  3. 也可切换到「手动输入」标签页粘贴参考资料",
+            ]
+            if error:
+                hint_lines.insert(0, f"搜索出错：{error}")
+                hint_lines.insert(1, "")
+            self.result_edit.setPlainText("\n".join(hint_lines))
+            self.generate_btn.setEnabled(False)
+            self.status_label.setText("⚠️ 未找到结果，请查看提示")
+            InfoBar.warning("未找到结果", "请参考结果区域的配置提示", parent=self)
 
     def _on_generate(self):
         """使用搜索结果生成内容"""
@@ -189,22 +215,17 @@ class SearchPage(QWidget):
             InfoBar.warning("提示", "请先搜索获取资料", parent=self)
             return
 
-        # 获取搜索关键词作为主题
         keyword = self.keyword_edit.text().strip()
-
-        fake_product = {
-            "title": keyword,
-            "description": self.result_edit.toPlainText(),
-            "price": "",
-            "local_images": [],
-        }
-
         self.generate_requested.emit({
-            "product": fake_product,
+            "product": {
+                "title": keyword,
+                "description": self.result_edit.toPlainText(),
+                "price": "",
+                "local_images": [],
+            },
             "style": "种草",
-            "search_results": self.result_edit.toPlainText(),  # 传递搜索结果
+            "search_results": self.result_edit.toPlainText(),
         })
-
         InfoBar.info("开始生成", f"正在根据「{keyword[:20]}」生成内容...", parent=self)
 
     def _on_manual_generate(self):
@@ -214,23 +235,17 @@ class SearchPage(QWidget):
             InfoBar.warning("提示", "请先输入参考资料", parent=self)
             return
 
-        # 提取第一行作为主题
         lines = manual_text.split("\n")
         keyword = lines[0][:30] if lines else "参考资料"
-
         self.result_edit.setPlainText(manual_text)
-
-        fake_product = {
-            "title": keyword,
-            "description": manual_text,
-            "price": "",
-            "local_images": [],
-        }
-
         self.generate_requested.emit({
-            "product": fake_product,
+            "product": {
+                "title": keyword,
+                "description": manual_text,
+                "price": "",
+                "local_images": [],
+            },
             "style": "种草",
             "search_results": manual_text,
         })
-
-        InfoBar.info("开始生成", f"正在根据手动输入的资料生成内容...", parent=self)
+        InfoBar.info("开始生成", "正在根据手动输入的资料生成内容...", parent=self)
