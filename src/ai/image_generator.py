@@ -250,8 +250,9 @@ def wait_for_send_button(timeout=PREVIEW_MAX_WAIT, session=SESSION):
 
 def wait_for_image(timeout=IMAGE_GEN_TIMEOUT, session=SESSION):
     """轮询检测 DALL-E 生成的大图（>500px，非上传预览小图）"""
+    # 只匹配 estuary 域名（DALL-E生成图），排除 oaiusercontent（可能是上传的参考图回显）
     js = (
-        'var imgs=document.querySelectorAll(\'img[src*="estuary"], img[src*="oaiusercontent"]\');'
+        'var imgs=document.querySelectorAll(\'img[src*="estuary"]\');'
         "var count=0,url='';"
         "for(var i=0;i<imgs.length;i++){"
         "if(imgs[i].naturalWidth>=500&&imgs[i].naturalHeight>=500)"
@@ -527,6 +528,12 @@ def download_via_network(dest_path, img_url, session=SESSION):
             estuary_reqs = [req for req in reqs if "estuary" in req.get("url", "")]
             if estuary_reqs:
                 rid = estuary_reqs[-1].get("requestId")
+        if not rid:
+            # 可能是上传的参考图URL(oaiusercontent)，不是DALL-E生成的图
+            all_img_reqs = [req for req in reqs if "oaiusercontent" in req.get("url", "") or "estuary" in req.get("url", "")]
+            if all_img_reqs:
+                rid = all_img_reqs[-1].get("requestId")
+                logger.warning("未找到estuary请求，使用最后一个图片请求: %s", reqs[-1].get("url", "")[:80])
         if not rid:
             logger.warning("未找到 estuary 请求")
             return False
