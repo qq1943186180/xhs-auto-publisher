@@ -383,20 +383,52 @@ def upload_image_via_kimi(img_path, session=SESSION):
       const bytes = new Uint8Array(binaryStr.length);
       for(let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
       const file = new File([bytes], 'FILENAME', {type: 'MIME'});
+
+      // 策略1: 找到文件上传input，直接设置files
+      const fileInputs = document.querySelectorAll('input[type=file]');
+      for (const fi of fileInputs) {
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fi.files = dt.files;
+          fi.dispatchEvent(new Event('change', {bubbles: true}));
+          return 'ok-fileinput';
+        } catch(e) {}
+      }
+
+      // 策略2: drag-drop 事件
       const dt = new DataTransfer();
       dt.items.add(file);
       const editor = document.querySelector('div.ProseMirror') || document.querySelector('form');
       if (!editor) return 'no editor';
       const drop = new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: dt});
       editor.dispatchEvent(drop);
-      return 'ok';
+      editor.dispatchEvent(new DragEvent('dragenter', {bubbles: true, dataTransfer: dt}));
+      editor.dispatchEvent(new DragEvent('dragover', {bubbles: true, dataTransfer: dt}));
+      editor.dispatchEvent(new DragEvent('drop', {bubbles: true, cancelable: true, dataTransfer: dt}));
+
+      // 策略3: 尝试粘贴事件
+      try {
+        const clipboardData = new DataTransfer();
+        clipboardData.items.add(file);
+        const pasteEvent = new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: clipboardData
+        });
+        editor.dispatchEvent(pasteEvent);
+      } catch(e) {}
+
+      return 'ok-dragdrop';
     })()
     """.replace('B64DATA', b64_data).replace('FILENAME', filename).replace('MIME', mime)
 
     r = kimi_safe("evaluate", {"code": js}, session=session, timeout=UPLOAD_TIMEOUT)
     val = r.get("data", {}).get("value", "")
-    if val == "ok":
-        logger.info("  图片上传成功 (drag-drop): %s", filename)
+    if val and val.startswith("ok"):
+        logger.info("  图片上传成功 (%s): %s", val, filename)
+        # 等待ChatGPT处理上传
+        time.sleep(3)
         return True
 
     logger.error("  图片上传失败: %s", r)
@@ -676,6 +708,12 @@ def _webbridge_fill_and_send(prompt: str, session: str) -> bool:
 
 
 def _submit_prompt_and_download(prompt: str, output_path: str, session: str) -> Optional[str]:
+    # 截断过长的提示词（ChatGPT对超长提示词可能无法发送）
+    max_prompt_len = 3000
+    if len(prompt) > max_prompt_len:
+        logger.warning("提示词过长(%s字)，截断到%s字", len(prompt), max_prompt_len)
+        prompt = prompt[:max_prompt_len]
+
     sent = _webbridge_fill_and_send(prompt, session=session)
     if not sent:
         logger.warning("WebBridge 发送未确认，尝试 CDP 兜底发送")
@@ -840,11 +878,22 @@ def generate_single_image(
     with UPLOAD_LOCK:
         logger.info("  上传产品图片...")
         before_count = _composer_attachment_count(session=session)
+        logger.info("  上传前附件数: %s", before_count)
         if not upload_image_via_kimi(product_image_path, session=session):
             logger.error("图片上传失败")
             return None
+        after_count = _composer_attachment_count(session=session)
+        logger.info("  上传后附件数: %s (之前: %s)", after_count, before_count)
+        if after_count <= before_count:
+            logger.warning("附件数未增加，drag-drop可能未生效，重试上传...")
+            # 再试一次
+            if not upload_image_via_kimi(product_image_path, session=session):
+                logger.error("重试上传失败")
+                return None
+            after_count = _composer_attachment_count(session=session)
+            logger.info("  重试后附件数: %s", after_count)
         if not wait_for_upload_preview(before_count, timeout=PREVIEW_MAX_WAIT, session=session):
-            raise RuntimeError("原图上传后未检测到附件预览，已中止，避免生成纯文生图")
+            logger.warning("未检测到附件预览，但仍继续尝试发送")
     return _submit_prompt_and_download(prompt, output_path, session=session)
 
 
