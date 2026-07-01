@@ -445,7 +445,18 @@ def upload_image_via_kimi(img_path, session=SESSION):
 
 
 def fill_chinese(text, session=SESSION):
-    return kimi("fill", {"selector": "div.ProseMirror", "value": text}, session=session)
+    r = kimi("fill", {"selector": "div.ProseMirror", "value": text}, session=session)
+    # 填入后触发input事件激活发送按钮
+    kimi_safe("evaluate", {
+        "code": """(() => {
+            const editor = document.querySelector('div.ProseMirror');
+            if (editor) {
+                editor.focus();
+                editor.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+        })()"""
+    }, session=session)
+    return r
 
 
 def click_send(session=SESSION):
@@ -730,9 +741,26 @@ def _webbridge_fill_and_send(prompt: str, session: str) -> bool:
     btn_status = str(r.get("data", {}).get("value", ""))
     logger.info("  发送按钮状态: %s", btn_status)
 
+    # 如果按钮disabled，等待它变为enabled（最多10秒）
+    if "disabled" in btn_status:
+        logger.info("  发送按钮disabled，等待激活...")
+        for _ in range(10):
+            time.sleep(1)
+            r = kimi_safe("evaluate", {
+                'code': """(() => {
+                    const btn = document.querySelector('button[data-testid="send-button"]');
+                    if (!btn) return 'no btn';
+                    return btn.disabled ? 'disabled' : 'enabled';
+                })()"""
+            }, session=session)
+            status = str(r.get("data", {}).get("value", ""))
+            if "enabled" in status:
+                logger.info("  发送按钮已激活")
+                break
+        else:
+            logger.warning("  发送按钮等待10秒仍disabled")
+
     logger.info("  发送...")
-    if not wait_for_send_button(session=session):
-        logger.warning("发送按钮未就绪(%s)，尝试直接点击兜底", btn_status)
     click_send(session=session)
     time.sleep(POLL_MEDIUM)
 
@@ -932,6 +960,19 @@ def generate_single_image(
                 return None
             after_count = _composer_attachment_count(session=session)
             logger.info("  重试后附件数: %s", after_count)
+        # 等待ChatGPT处理附件上传（关键！发送按钮需要附件处理完成才会enabled）
+        logger.info("  等待ChatGPT处理附件...")
+        time.sleep(5)
+        # 检查发送按钮是否已激活
+        btn_r = kimi_safe("evaluate", {
+            "code": """(() => {
+                const btn = document.querySelector('button[data-testid="send-button"]');
+                if (!btn) return 'no btn';
+                return btn.getAttribute('aria-label') + '|' + (btn.disabled ? 'disabled' : 'enabled');
+            })()"""
+        }, session=session)
+        btn_status = str(btn_r.get("data", {}).get("value", ""))
+        logger.info("  附件处理后发送按钮: %s", btn_status)
         if not wait_for_upload_preview(before_count, timeout=PREVIEW_MAX_WAIT, session=session):
             logger.warning("未检测到附件预览，但仍继续尝试发送")
     return _submit_prompt_and_download(prompt, output_path, session=session)
