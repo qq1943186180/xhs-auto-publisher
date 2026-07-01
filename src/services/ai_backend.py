@@ -73,37 +73,52 @@ def _product_image_context(product: dict | None, extra: str = "") -> str:
 
 def _download_product_image_from_url(url: str, product_name: str = "") -> str:
     """从 main_images URL 下载图片到临时文件，作为生图参考图。
-    返回本地文件路径，失败返回空字符串。
+    返回本地文件路径（JPG格式），失败返回空字符串。
     """
-    import tempfile
     import requests
+    from PIL import Image as PILImage
+    import io as _io
     try:
-        # 获取高清版本：w/140 -> w/1080
-        hd_url = url.replace("w/140", "w/1080") if "w/140" in url else url
+        # 获取高清JPG版本：w/140 -> w/1080, format/webp -> format/jpg
+        hd_url = url
+        if "w/140" in hd_url:
+            hd_url = hd_url.replace("w/140", "w/1080")
+        if "format/webp" in hd_url:
+            hd_url = hd_url.replace("format/webp", "format/jpg")
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://www.xiaohongshu.com/",
         }
-        # 先尝试高清URL，失败回退原始URL
-        for try_url in [hd_url, url]:
+        # 先尝试高清JPG URL，失败回退高清WEBP(转换)，最后原始URL
+        urls_to_try = [hd_url]
+        if "format/jpg" in hd_url:
+            webp_url = hd_url.replace("format/jpg", "format/webp")
+            urls_to_try.append(webp_url)
+        urls_to_try.append(url)
+
+        for try_url in urls_to_try:
             try:
                 resp = requests.get(try_url, timeout=15, headers=headers)
-                if resp.status_code == 200 and len(resp.content) > 500:
-                    # 保存到临时目录
-                    ext = ".jpg"
-                    if ".png" in try_url:
-                        ext = ".png"
-                    elif ".webp" in try_url:
-                        ext = ".webp"
-                    safe_name = _safe_dir_name(product_name) if product_name else "ref"
-                    tmp_dir = Path.home() / ".xhs-publisher" / "ref_images"
-                    tmp_dir.mkdir(parents=True, exist_ok=True)
-                    tmp_path = str(tmp_dir / f"{safe_name}{ext}")
-                    with open(tmp_path, "wb") as f:
-                        f.write(resp.content)
-                    logger.info("已下载参考图: %s -> %s (%s bytes)",
-                                try_url[:60], tmp_path, len(resp.content))
-                    return tmp_path
+                if resp.status_code != 200 or len(resp.content) < 500:
+                    continue
+
+                # 用Pillow打开并统一转为JPG格式（ChatGPT不支持WEBP上传）
+                pil_img = PILImage.open(_io.BytesIO(resp.content))
+                if pil_img.mode in ("RGBA", "P", "LA", "L"):
+                    pil_img = pil_img.convert("RGB")
+
+                safe_name = _safe_dir_name(product_name) if product_name else "ref"
+                tmp_dir = Path.home() / ".xhs-publisher" / "ref_images"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = str(tmp_dir / f"{safe_name}.jpg")
+
+                # 保存为真正的JPG格式
+                pil_img.save(tmp_path, format="JPEG", quality=95)
+                logger.info("已下载参考图(JPG): %s -> %s (%sx%s, %s bytes)",
+                            try_url[:60], tmp_path, pil_img.size[0], pil_img.size[1],
+                            os.path.getsize(tmp_path))
+                return tmp_path
             except Exception as e:
                 logger.warning("下载参考图失败 (%s): %s", try_url[:60], e)
                 continue
