@@ -71,6 +71,68 @@ def _product_image_context(product: dict | None, extra: str = "") -> str:
     return "\n".join(parts)[:1200]
 
 
+def _download_product_image_from_url(url: str, product_name: str = "") -> str:
+    """从 main_images URL 下载图片到临时文件，作为生图参考图。
+    返回本地文件路径，失败返回空字符串。
+    """
+    import tempfile
+    import requests
+    try:
+        # 获取高清版本：w/140 -> w/1080
+        hd_url = url.replace("w/140", "w/1080") if "w/140" in url else url
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.xiaohongshu.com/",
+        }
+        # 先尝试高清URL，失败回退原始URL
+        for try_url in [hd_url, url]:
+            try:
+                resp = requests.get(try_url, timeout=15, headers=headers)
+                if resp.status_code == 200 and len(resp.content) > 500:
+                    # 保存到临时目录
+                    ext = ".jpg"
+                    if ".png" in try_url:
+                        ext = ".png"
+                    elif ".webp" in try_url:
+                        ext = ".webp"
+                    safe_name = _safe_dir_name(product_name) if product_name else "ref"
+                    tmp_dir = Path.home() / ".xhs-publisher" / "ref_images"
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_path = str(tmp_dir / f"{safe_name}{ext}")
+                    with open(tmp_path, "wb") as f:
+                        f.write(resp.content)
+                    logger.info("已下载参考图: %s -> %s (%s bytes)",
+                                try_url[:60], tmp_path, len(resp.content))
+                    return tmp_path
+            except Exception as e:
+                logger.warning("下载参考图失败 (%s): %s", try_url[:60], e)
+                continue
+    except Exception as e:
+        logger.error("下载参考图异常: %s", e)
+    return ""
+
+
+def _resolve_product_image(product: dict | None) -> str:
+    """获取商品参考图路径。
+    优先 local_images（本地图），为空时从 main_images URL 下载到临时文件。
+    返回本地文件路径，无图返回空字符串。
+    """
+    if not product:
+        return ""
+    # 1. 优先使用本地图片
+    local_imgs = product.get("local_images", [])
+    for img in local_imgs:
+        if img and os.path.exists(img):
+            return img
+    # 2. 本地图为空，从 main_images URL 下载
+    main_imgs = product.get("main_images", [])
+    if main_imgs:
+        product_name = product.get("title", "") or product.get("name", "")
+        logger.info("local_images为空，从URL下载参考图: %s", main_imgs[0][:60])
+        return _download_product_image_from_url(main_imgs[0], product_name)
+    return ""
+
+
 def _extract_selling_points(product: dict | None) -> str:
     """从产品数据中提取核心卖点，供 LLM 生成文案使用。"""
     product = product or {}
@@ -170,7 +232,6 @@ class AIBackend(QObject):
                 price = str(product.get("price", "")) or "未知"
                 # 从 tags / extra_data 中提取卖点
                 selling_points = _extract_selling_points(product)
-                local_imgs = product.get("local_images", [])
 
                 errors = []
                 has_llm_key = km.has_keys()
@@ -251,9 +312,11 @@ class AIBackend(QObject):
                     try:
                         from src.ai.image_generator import generate_images
                         output_dir = _new_image_output_dir(product_name)
-                        product_img = None
-                        if local_imgs and os.path.exists(local_imgs[0]):
-                            product_img = local_imgs[0]
+                        product_img = _resolve_product_image(product)
+                        if product_img:
+                            logger.info("生图参考图: %s", product_img)
+                        else:
+                            logger.warning("无参考图，将使用纯文字生图")
                         img_result = generate_images(
                             product_name=product_name,
                             output_dir=output_dir,
@@ -454,7 +517,6 @@ class AIBackend(QObject):
 
         def _run():
             product_name = product.get("title", "")
-            local_imgs = product.get("local_images", [])
             errors = []
             image_results = []
             images = []
@@ -463,9 +525,11 @@ class AIBackend(QObject):
                 if not check_kimi_health():
                     errors.append(kimi_health_message(start_if_needed=True))
                 else:
-                    product_img = None
-                    if local_imgs and os.path.exists(local_imgs[0]):
-                        product_img = local_imgs[0]
+                    product_img = _resolve_product_image(product)
+                    if product_img:
+                        logger.info("重试生图参考图: %s", product_img)
+                    else:
+                        logger.warning("无参考图，将使用纯文字生图")
                     output_dir = _reuse_or_create_image_output_dir(product_name, existing_images)
                     img_result = generate_images(
                         product_name=product_name,
@@ -560,12 +624,12 @@ class AIBackend(QObject):
                 if not check_kimi_health():
                     errors.append(kimi_health_message(start_if_needed=True))
                 else:
-                    local_imgs = (product or {}).get("local_images", [])
-                    product_img = None
-                    if local_imgs and os.path.exists(local_imgs[0]):
-                        product_img = local_imgs[0]
-                    elif existing_images:
+                    # 优先级: local_images > main_images URL下载 > existing_images
+                    product_img = _resolve_product_image(product)
+                    if not product_img and existing_images:
                         product_img = existing_images[0]
+                    if product_img:
+                        logger.info("笔记生图参考图: %s", product_img)
                     else:
                         errors.append("未找到采集产品图，将使用文字提示词直接生图")
 
@@ -721,10 +785,11 @@ class AIBackend(QObject):
                 if not check_kimi_health():
                     errors.append(kimi_health_message(start_if_needed=True))
                 else:
-                    local_imgs = product.get("local_images", [])
-                    product_img = None
-                    if local_imgs and os.path.exists(local_imgs[0]):
-                        product_img = local_imgs[0]
+                    product_img = _resolve_product_image(product)
+                    if product_img:
+                        logger.info("重新生图参考图: %s", product_img)
+                    else:
+                        logger.warning("无参考图，将使用纯文字生图")
                     output_dir = _new_image_output_dir(product_name)
                     img_result = generate_images(
                         product_name=product_name,
