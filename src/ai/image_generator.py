@@ -251,6 +251,22 @@ def wait_for_send_button(timeout=PREVIEW_MAX_WAIT, session=SESSION):
 def wait_for_image(timeout=IMAGE_GEN_TIMEOUT, session=SESSION):
     """轮询检测 DALL-E 生成的大图（>500px，非上传预览小图）"""
     # 只匹配 estuary 域名（DALL-E生成图），排除 oaiusercontent（可能是上传的参考图回显）
+    # 同时排除已存在的图片（通过记录初始图片数量）
+    initial_js = (
+        'var imgs=document.querySelectorAll(\'img[src*="estuary"]\');'
+        "var initCount=0,initUrls=[];"
+        "for(var i=0;i<imgs.length;i++){"
+        "if(imgs[i].naturalWidth>=500&&imgs[i].naturalHeight>=500)"
+        "{initCount++;initUrls.push(imgs[i].src);}}"
+        "initCount+'|'+initUrls.join(',');"
+    )
+    r0 = kimi_safe("evaluate", {"code": initial_js}, session=session)
+    init_val = str(r0.get("data", {}).get("value", "0|"))
+    init_parts = init_val.split("|", 1)
+    init_count = int(init_parts[0]) if init_parts[0].isdigit() else 0
+    init_urls = set(init_parts[1].split(",")) if len(init_parts) > 1 else set()
+    logger.info("  初始estuary图片数: %s (等待新增)", init_count)
+
     js = (
         'var imgs=document.querySelectorAll(\'img[src*="estuary"]\');'
         "var count=0,url='';"
@@ -272,8 +288,12 @@ def wait_for_image(timeout=IMAGE_GEN_TIMEOUT, session=SESSION):
         r = kimi_safe("evaluate", {"code": js}, session=session)
         val = str(r.get("data", {}).get("value", "0:"))
         parts = val.split(":", 1)
-        if parts[0].isdigit() and int(parts[0]) > 0 and len(parts) > 1 and parts[1].startswith("http"):
-            return parts[1]
+        if parts[0].isdigit() and len(parts) > 1 and parts[1].startswith("http"):
+            count = int(parts[0])
+            url = parts[1]
+            # 必须是新增的图片（不在初始URL集合中）
+            if count > init_count or url not in init_urls:
+                return url
         return None
     result = poll_until(check, timeout, POLL_LONG, "DALL-E 生图")
     if not result:
