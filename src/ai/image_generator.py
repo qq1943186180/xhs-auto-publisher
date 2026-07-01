@@ -232,10 +232,19 @@ def wait_for_page_ready(timeout=PAGE_READY_TIMEOUT, session=SESSION):
 def wait_for_send_button(timeout=PREVIEW_MAX_WAIT, session=SESSION):
     def check():
         r = kimi_safe("evaluate", {
-            'code': 'document.querySelector(\'button[data-testid="send-button"]\')?.getAttribute("aria-label")'
+            'code': """(() => {
+                const btn = document.querySelector('button[data-testid="send-button"]');
+                if (!btn) return 'no btn';
+                const label = btn.getAttribute('aria-label') || '';
+                const disabled = btn.disabled;
+                return label + '|' + (disabled ? 'disabled' : 'enabled');
+            })()"""
         }, session=session)
-        label = str(r.get("data", {}).get("value", ""))
-        return "发送" in label
+        val = str(r.get("data", {}).get("value", ""))
+        # 发送按钮存在且未禁用
+        if "发送" in val and "enabled" in val:
+            return True
+        return False
     return poll_until(check, timeout, POLL_SHORT, "发送按钮")
 
 
@@ -445,9 +454,28 @@ def click_send(session=SESSION):
         "code": """(() => {
             const btn = document.querySelector('button[data-testid="send-button"]');
             if (!btn) return 'no btn';
+            const label = btn.getAttribute('aria-label') || '';
+            const wasDisabled = btn.disabled;
+            // 临时启用按钮并点击
             btn.disabled = false;
             btn.click();
-            return 'clicked';
+            // 如果按钮原本是disabled的，尝试用Enter键发送
+            if (wasDisabled) {
+                const editor = document.querySelector('div.ProseMirror');
+                if (editor) {
+                    editor.focus();
+                    const enterEvent = new KeyboardEvent('keydown', {
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    editor.dispatchEvent(enterEvent);
+                }
+            }
+            return 'clicked|' + label + '|' + (wasDisabled ? 'was_disabled' : 'was_enabled');
         })()"""
     }, session=session)
     return r
@@ -690,9 +718,21 @@ def _webbridge_fill_and_send(prompt: str, session: str) -> bool:
     fill_chinese(prompt, session=session)
     time.sleep(POLL_MEDIUM)
 
+    # 检查发送按钮状态
+    r = kimi_safe("evaluate", {
+        'code': """(() => {
+            const btn = document.querySelector('button[data-testid="send-button"]');
+            if (!btn) return 'no btn';
+            const label = btn.getAttribute('aria-label') || '';
+            return label + '|' + (btn.disabled ? 'disabled' : 'enabled');
+        })()"""
+    }, session=session)
+    btn_status = str(r.get("data", {}).get("value", ""))
+    logger.info("  发送按钮状态: %s", btn_status)
+
     logger.info("  发送...")
     if not wait_for_send_button(session=session):
-        logger.warning("发送按钮未就绪，尝试直接点击兜底")
+        logger.warning("发送按钮未就绪(%s)，尝试直接点击兜底", btn_status)
     click_send(session=session)
     time.sleep(POLL_MEDIUM)
 
